@@ -1,0 +1,405 @@
+#!/usr/bin/env bash
+# baton — menu of claude/codex SESSIONS to resume natively (no tmux).
+#
+# Pass the baton: start a session on one machine, pick it up on another over SSH.
+# Lists sessions grouped by the directory they were started in, newest first.
+# By default shows only ACTIVE sessions (a live claude/codex process exists);
+# pass -a/--all to include closed ones. Selecting a session:
+#   * if it is live, kills that process (after confirmation) so the work can't
+#     diverge between two machines,
+#   * cd's to the session's original directory (required: resume is cwd-scoped),
+#   * runs `claude --resume <id>` / `codex resume <id>` NATIVELY in this terminal.
+#
+# Because nothing runs under tmux, mouse select / copy-paste / scroll are fully
+# native on both Mac and Windows-SSH. Installs as `baton` (with `agents` as a
+# backward-compatible alias).
+#
+# Usage:  baton [-a|--all]
+# Run from Windows with:  ssh -t <mac-host> baton
+
+set -uo pipefail
+
+# Absolute path to self, for the fzf preview callback.
+case $0 in
+  /*) SELF=$0 ;;
+  *)  SELF=$(command -v "$0" 2>/dev/null || echo "$PWD/$0") ;;
+esac
+# Name we were invoked as (baton, or the agents alias) — for user-facing messages.
+PROG=$(basename "$SELF")
+
+# --- embedded scanner -------------------------------------------------------
+# _scan list <show_all 0|1>     -> TSV rows
+# _scan preview <path> <tool>   -> human-readable tail of a session
+_scan() {
+  python3 - "$@" <<'PY'
+import json, os, glob, subprocess, sys, time
+
+HOME = os.path.expanduser('~')
+mode = sys.argv[1] if len(sys.argv) > 1 else 'list'
+
+# ---------- shared helpers ----------
+def ago(sec):
+    d = max(0, time.time() - sec)
+    if d < 60:    return "%ds" % int(d)
+    if d < 3600:  return "%dm" % int(d/60)
+    if d < 86400: return "%dh" % int(d/3600)
+    return "%dd" % int(d/86400)
+
+def first_real_text(text):
+    t = (text or "").strip()
+    if not t: return None
+    if t.startswith('<'): return None              # system/caveat/reminder blocks
+    low = t[:40].lower()
+    if low.startswith('caveat') or 'instructions' in low: return None
+    return ' '.join(t.split())[:90]
+
+# ---------- live process detection ----------
+def proc_cwd(pid):
+    """Working directory of a pid. Linux: read /proc/<pid>/cwd (instant).
+    macOS / no-proc: fall back to lsof. Returns None if undeterminable."""
+    # Linux fast path: /proc/<pid>/cwd is a symlink to the process cwd.
+    link = '/proc/%s/cwd' % pid
+    try:
+        if os.path.islink(link):
+            return os.readlink(link)
+    except OSError:
+        pass
+    # Portable fallback (macOS uses this): lsof.
+    try:
+        out = subprocess.run(['lsof','-a','-p',str(pid),'-d','cwd','-Fn'],
+                             capture_output=True, text=True, timeout=5).stdout
+        for ln in out.splitlines():
+            if ln.startswith('n'):
+                return ln[1:]
+    except Exception:
+        pass
+    return None
+
+def running():
+    """Return list of (tool, cwd, pid) for live interactive claude/codex leaves."""
+    try:
+        out = subprocess.run(['ps','-axww','-o','pid=,command='],
+                             capture_output=True, text=True).stdout
+    except Exception:
+        return []
+    res = []
+    for line in out.splitlines():
+        s = line.strip()
+        if not s: continue
+        pid, _, cmd = s.partition(' ')
+        if not pid.isdigit(): continue
+        tool = None
+        # Real claude leaf: the toolbox injects --settings on the actual binary.
+        if '/claude-code/' in cmd and '/claude ' in cmd and '--settings' in cmd:
+            tool = 'claude'
+        # Interactive codex leaf (exclude non-interactive `codex exec` runs).
+        elif '/bin/codex' in cmd and ' exec' not in cmd:
+            tool = 'codex'
+        if not tool: continue
+        cwd = proc_cwd(pid)
+        if cwd:
+            res.append((tool, cwd, int(pid)))
+    return res
+
+# ---------- session discovery ----------
+def claude_files():
+    out = []
+    for f in glob.glob(os.path.join(HOME,'.claude','projects','*','*.jsonl')):
+        try: mt = os.path.getmtime(f)
+        except OSError: continue
+        out.append(('claude', f, mt))
+    return out
+
+def codex_files():
+    out = []
+    for f in glob.glob(os.path.join(HOME,'.codex','sessions','*','*','*','rollout-*.jsonl')):
+        try: mt = os.path.getmtime(f)
+        except OSError: continue
+        out.append(('codex', f, mt))
+    return out
+
+def claude_meta(f):
+    """(session_id, launch_cwd, first_prompt). id == filename stem."""
+    sid = os.path.basename(f)[:-6]
+    cwd = prompt = None
+    try:
+        with open(f) as fh:
+            for i, ln in enumerate(fh):
+                if i > 400: break
+                try: d = json.loads(ln)
+                except Exception: continue
+                if not isinstance(d, dict): continue
+                if cwd is None and isinstance(d.get('cwd'), str):
+                    cwd = d['cwd']
+                if prompt is None and d.get('type') == 'user':
+                    msg = d.get('message', {})
+                    c = msg.get('content') if isinstance(msg, dict) else None
+                    text = None
+                    if isinstance(c, str): text = c
+                    elif isinstance(c, list):
+                        for p in c:
+                            if isinstance(p, dict) and p.get('type') == 'text':
+                                text = p.get('text'); break
+                    prompt = first_real_text(text) or prompt
+                if cwd and prompt: break
+    except OSError:
+        pass
+    return sid, cwd, prompt
+
+def codex_meta(f):
+    """(session_id, launch_cwd, first_prompt) from the rollout file."""
+    sid = cwd = prompt = None
+    try:
+        with open(f) as fh:
+            for i, ln in enumerate(fh):
+                if i > 300: break
+                try: d = json.loads(ln)
+                except Exception: continue
+                if not isinstance(d, dict): continue
+                if d.get('type') == 'session_meta':
+                    p = d.get('payload', {}) or {}
+                    sid = sid or p.get('id')
+                    cwd = cwd or p.get('cwd')
+                if prompt is None:
+                    pl = d.get('payload', d)
+                    if isinstance(pl, dict) and (pl.get('type') in ('user_message','message') or pl.get('role') == 'user'):
+                        c = pl.get('content') or pl.get('text') or pl.get('message')
+                        text = None
+                        if isinstance(c, str): text = c
+                        elif isinstance(c, list):
+                            for q in c:
+                                if isinstance(q, dict) and q.get('text'):
+                                    text = q['text']; break
+                        prompt = first_real_text(text) or prompt
+                if sid and cwd and prompt: break
+    except OSError:
+        pass
+    return sid, cwd, prompt
+
+# ---------- preview ----------
+# Show a clean Q&A transcript: the user's real questions and the assistant's
+# actual answers — NOT thinking blocks, tool calls, tool results, or the
+# "let me check X / now let me Y" narration between tool calls. We do this by
+# keeping only text content, dropping tool_result-wrapper user turns, and
+# collapsing consecutive assistant chatter into the single latest answer per
+# turn (the substantive reply that precedes the next user question).
+def preview(path, tool):
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        print("(cannot read session file)"); return
+
+    def clean(s):
+        s = ' '.join((s or '').split())
+        if not s or s.startswith('<'): return None
+        if s[:30].lower().startswith('caveat'): return None
+        return s
+
+    seq = []   # list of [role, text]; assistant runs collapse to the latest
+    def add(role, text):
+        text = clean(text)
+        if not text: return
+        if role == 'assistant' and seq and seq[-1][0] == 'assistant':
+            seq[-1][1] = text          # collapse narration -> keep latest
+        else:
+            seq.append([role, text])
+
+    for ln in lines:
+        try: d = json.loads(ln)
+        except Exception: continue
+        if not isinstance(d, dict): continue
+        if tool == 'claude':
+            t = d.get('type')
+            if t not in ('user','assistant'): continue
+            msg = d.get('message', {})
+            c = msg.get('content') if isinstance(msg, dict) else None
+            if t == 'user':
+                if isinstance(c, list) and any(isinstance(p, dict) and p.get('type') == 'tool_result' for p in c):
+                    continue   # tool output fed back in, not a real question
+                if isinstance(c, str): add('user', c)
+                elif isinstance(c, list):
+                    parts = [p.get('text') for p in c
+                             if isinstance(p, dict) and p.get('type') == 'text' and p.get('text')]
+                    if parts: add('user', ' '.join(parts))
+            else:  # assistant: text blocks only (skips thinking + tool_use)
+                if isinstance(c, list):
+                    parts = [p.get('text') for p in c
+                             if isinstance(p, dict) and p.get('type') == 'text' and p.get('text')]
+                    if parts: add('assistant', ' '.join(parts))
+        else:  # codex
+            pl = d.get('payload', d)
+            if not isinstance(pl, dict): continue
+            ty = pl.get('type'); rl = pl.get('role')
+            if not (rl in ('user','assistant') or ty in ('user_message','agent_message','message')):
+                continue
+            role = rl or ('assistant' if 'agent' in (ty or '') else 'user')
+            c = pl.get('content') or pl.get('text')
+            text = None
+            if isinstance(c, str): text = c
+            elif isinstance(c, list):
+                parts = [q.get('text') for q in c if isinstance(q, dict) and q.get('text')]
+                text = ' '.join(parts)
+            add(role, text)
+
+    for role, t in seq[-12:]:
+        tag = 'You ▸' if role == 'user' else '  ◂ '
+        print("%s %s" % (tag, t[:300]))
+    if not seq:
+        print("(no readable messages yet)")
+
+# ---------- list ----------
+def build(show_all):
+    acts = running()
+    active_pairs = {}                       # (tool,cwd) -> [pids]
+    for tool, cwd, pid in acts:
+        active_pairs.setdefault((tool, cwd), []).append(pid)
+
+    files = claude_files() + codex_files()
+    files.sort(key=lambda x: x[2], reverse=True)   # newest mtime first
+
+    rows = []
+    used = {}                               # (tool,cwd) -> count marked active
+    parsed = 0
+    PARSE_CAP = 90
+    RECENT_INACTIVE = 10                     # default view: active + N most-recent closed
+    inactive_kept = 0
+    for tool, path, mt in files:            # files are newest-mtime first
+        if parsed >= PARSE_CAP: break
+        parsed += 1
+        if tool == 'claude': sid, cwd, prompt = claude_meta(path)
+        else:                sid, cwd, prompt = codex_meta(path)
+        if not sid or not cwd: continue
+        key = (tool, cwd)
+        is_active = 0
+        if key in active_pairs:
+            u = used.get(key, 0)
+            if u < len(active_pairs[key]):
+                used[key] = u + 1
+                is_active = 1
+        if not is_active and not show_all:
+            # Default view: keep only the N most-recent closed sessions. Because
+            # files are sorted newest-first, the first N inactive we see are them.
+            if inactive_kept >= RECENT_INACTIVE:
+                continue
+            inactive_kept += 1
+        pids = ','.join(str(p) for p in active_pairs.get(key, [])) if is_active else ''
+        rows.append({'path':path,'tool':tool,'id':sid,'cwd':cwd,
+                     'active':is_active,'pids':pids,'mtime':mt,'prompt':prompt or '(no prompt yet)'})
+
+    # Group by directory: most-recently-active group first, sessions by date.
+    gmax = {}
+    for r in rows:
+        gmax[r['cwd']] = max(gmax.get(r['cwd'], 0), r['mtime'])
+    rows.sort(key=lambda r: (-gmax[r['cwd']], r['cwd'], -r['mtime']))
+
+    # --all has a generous safety cap; default view is already bounded by the
+    # loop (all active + RECENT_INACTIVE) so it isn't truncated here.
+    if show_all:
+        rows = rows[:40]
+
+    # ANSI colors (fzf --ansi renders these).
+    C_DIR = '\033[1;36m'   # bold cyan folder header
+    C_DOT = '\033[1;32m'   # green live dot
+    C_TOOL= '\033[35m'     # magenta tool name
+    C_AGE = '\033[90m'     # dim age
+    C_TXT = '\033[37m'     # prompt text
+    C_OFF = '\033[0m'
+
+    # One line per session. A folder header row is emitted once per group; its
+    # tab-fields carry no session id, so selecting it is a no-op (guarded later).
+    # Session rows are indented and always self-describing (tool · age · prompt).
+    prev = None
+    home = os.path.expanduser('~')
+    for r in rows:
+        if r['cwd'] != prev:
+            prev = r['cwd']
+            disp_dir = r['cwd'].replace(home, '~')
+            header = "%s%s%s" % (C_DIR, disp_dir, C_OFF)
+            # header row: empty id/path -> not selectable
+            print('\t'.join(['', '', '', r['cwd'], '0', '', header]))
+        dot = ("%s●%s" % (C_DOT, C_OFF)) if r['active'] else ' '
+        a   = "%s%4s%s" % (C_AGE, ago(r['mtime']), C_OFF)
+        tool= "%s%-6s%s" % (C_TOOL, r['tool'], C_OFF)
+        txt = "%s%s%s" % (C_TXT, r['prompt'][:80], C_OFF)
+        disp = "  %s %s %s  %s" % (dot, tool, a, txt)
+        print('\t'.join([r['path'], r['tool'], r['id'], r['cwd'], str(r['active']), r['pids'], disp]))
+
+if mode == 'preview':
+    preview(sys.argv[2], sys.argv[3])
+else:
+    show_all = (len(sys.argv) > 2 and sys.argv[2] == '1')
+    build(show_all)
+PY
+}
+
+# --- preview reentry --------------------------------------------------------
+if [ "${1:-}" = "--preview" ]; then
+  shift
+  # Folder header rows pass an empty path; nothing to preview.
+  if [ -z "${1:-}" ]; then
+    echo "  (folder — pick a session below it)"
+    exit 0
+  fi
+  _scan preview "$@"
+  exit 0
+fi
+
+command -v python3 >/dev/null 2>&1 || { echo "$PROG: python3 required" >&2; exit 1; }
+command -v fzf     >/dev/null 2>&1 || { echo "$PROG: fzf required" >&2; exit 1; }
+if [ ! -t 1 ]; then
+  echo "$PROG needs a terminal. From another machine run:  ssh -t <host> $PROG" >&2
+  exit 1
+fi
+
+show_all=0
+case "${1:-}" in
+  -a|--all) show_all=1 ;;
+esac
+
+rows=$(_scan list "$show_all")
+
+if [ -z "$rows" ]; then
+  echo "No claude/codex sessions found."
+  exit 0
+fi
+
+hdr="enter resume · esc quit"
+[ "$show_all" = 0 ] && hdr="● live + 10 recent · $hdr · ($PROG --all for everything)"
+
+sel=$(printf '%s\n' "$rows" | fzf \
+  --ansi \
+  --delimiter='\t' \
+  --with-nth=7 \
+  --no-sort \
+  --layout=reverse \
+  --prompt='resume> ' \
+  --header="$hdr" \
+  --preview="$SELF --preview {1} {2}" \
+  --preview-window='right,55%,wrap' \
+  --bind='esc:abort')
+[ -z "$sel" ] && exit 0
+
+# Parse the chosen TSV line. Fields 1 (path) and 7 (display) are consumed only
+# by fzf (preview callback / display column), so they're discarded here as `_`.
+IFS=$'\t' read -r _ tool id cwd active pids _ <<<"$sel"
+# Folder header rows have no id — selecting one just exits cleanly.
+[ -z "$id" ] && exit 0
+
+# If live, confirm and end the existing process so work can't diverge.
+if [ "$active" = "1" ] && [ -n "$pids" ]; then
+  echo "This session is LIVE (pid(s): $pids) in: $cwd"
+  printf "End that process and resume here? [y/N] "
+  read -r ans
+  case "$ans" in
+    y|Y) for p in ${pids//,/ }; do kill "$p" 2>/dev/null; done; sleep 1 ;;
+    *)   echo "cancelled"; exit 0 ;;
+  esac
+fi
+
+cd "$cwd" 2>/dev/null || { echo "$PROG: cannot cd to $cwd" >&2; exit 1; }
+echo "Resuming $tool in $cwd …"
+if [ "$tool" = "claude" ]; then
+  exec command claude --resume "$id"
+else
+  exec command codex resume "$id"
+fi
