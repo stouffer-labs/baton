@@ -72,7 +72,9 @@ command -v fzf >/dev/null 2>&1 || \
 
 # Resolve the baton script: from a local checkout, or downloaded from GitHub.
 tmp_dir=""
-cleanup() { [[ -n "$tmp_dir" ]] && rm -rf -- "$tmp_dir"; }
+# `return 0` so a no-op cleanup (e.g. --from-source, where tmp_dir is empty)
+# doesn't make the EXIT trap's last command non-zero and exit the script 1.
+cleanup() { [[ -n "$tmp_dir" ]] && rm -rf -- "$tmp_dir"; return 0; }
 trap cleanup EXIT
 
 if [[ -n "$FROM_SOURCE" ]]; then
