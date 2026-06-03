@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Shellcheck + Python syntax
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Shellcheck shell scripts
+        run: shellcheck bin/baton scripts/install.sh
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Check embedded scanner compiles
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          src = open('bin/baton').read()
+          m = re.search(r"python3 - \"\$@\" <<'PY'\n(.*?)\nPY", src, re.S)
+          if not m:
+              print("could not extract embedded python from bin/baton")
+              sys.exit(1)
+          compile(m.group(1), 'embedded-scanner', 'exec')
+          print("embedded python compiles clean")
+          PY
