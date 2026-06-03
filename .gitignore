@@ -1,0 +1,19 @@
+# Scratch / debug
+tmp/
+*.log
+
+# Local tool/editor state
+.claude/
+.codex/
+.comparo/
+.vscode/
+.idea/
+*.swp
+
+# Archives / snapshots
+*.zip
+*.tar.gz
+
+# OS junk
+.DS_Store
+._*
