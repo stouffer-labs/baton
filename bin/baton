@@ -14,7 +14,19 @@
 # native on both Mac and Windows-SSH. Installs as `baton` (with `agents` as a
 # backward-compatible alias).
 #
+# SHELL INTEGRATION (installed for you): the installer adds
+#   eval "$(baton shell-init bash)"   # or zsh
+# to your rc, which defines a `baton` shell FUNCTION. The function cd's your REAL
+# shell to the session dir, then resumes — so when the session ends you are left
+# IN the project directory (instead of back at ~). The function calls
+# `baton --emit`, which runs the picker + live-handling and prints the chosen
+# `tool<TAB>id<TAB>cwd` on stdout for the function to act on. Run as a bare binary
+# with no function in play, baton falls back to cd + exec resume (resume works
+# everywhere; only then does your shell stay put).
+#
 # Usage:  baton [-a|--all]
+#         baton shell-init [bash|zsh]   # print the shell function (for eval)
+#         baton --emit [-a|--all]       # internal: print selection, don't resume
 # Run from Windows with:  ssh -t <mac-host> baton
 
 set -uo pipefail
@@ -344,22 +356,69 @@ if [ "${1:-}" = "--preview" ]; then
   exit 0
 fi
 
+# --- shell integration ------------------------------------------------------
+# `baton shell-init [bash|zsh]` prints a shell FUNCTION to be eval'd from your rc
+# (the installer wires this for you). The function runs IN your shell, so it can
+# cd your real shell into the session dir and THEN resume — leaving you in the
+# project directory when the session ends. It calls the binary by ABSOLUTE PATH
+# ($SELF), which is both PATH-independent and recursion-proof (a bare `baton`
+# would re-enter the function). Needs no python3/fzf/tty, so it runs before those.
+if [ "${1:-}" = "shell-init" ]; then
+  # Bake in an ABSOLUTE path so the function works from any cwd. $SELF is already
+  # absolute when baton is invoked via PATH (installed case); absolutize it here
+  # so a relative dev invocation (./bin/baton shell-init) is also correct.
+  bin="$SELF"
+  case "$bin" in
+    /*) : ;;
+    *)  bin="$(cd "$(dirname "$bin")" 2>/dev/null && pwd)/$(basename "$bin")" ;;
+  esac
+  cat <<EOF
+baton() {
+  local sel tool id cwd st
+  sel="\$('$bin' --emit "\$@")" || return \$?
+  [ -n "\$sel" ] || return 0
+  IFS=\$'\t' read -r tool id cwd <<< "\$sel"
+  case "\$tool" in claude|codex) ;; *) printf 'baton: unexpected selection\n' >&2; return 2 ;; esac
+  [ -n "\$id" ] && [ -n "\$cwd" ] || { printf 'baton: incomplete selection\n' >&2; return 2; }
+  cd -- "\$cwd" || return
+  case "\$tool" in
+    claude) command claude --resume "\$id"; st=\$? ;;
+    codex)  command codex resume "\$id"; st=\$? ;;
+  esac
+  return "\$st"
+}
+agents() { baton "\$@"; }
+EOF
+  exit 0
+fi
+
 command -v python3 >/dev/null 2>&1 || { echo "$PROG: python3 required" >&2; exit 1; }
 command -v fzf     >/dev/null 2>&1 || { echo "$PROG: fzf required" >&2; exit 1; }
-if [ ! -t 1 ]; then
+
+# Args are order-independent: --emit (internal: print selection instead of
+# resuming, for the shell function) and -a/--all (include closed sessions).
+emit=0
+show_all=0
+for arg in "$@"; do
+  case "$arg" in
+    --emit)   emit=1 ;;
+    -a|--all) show_all=1 ;;
+  esac
+done
+
+# The picker draws on the controlling terminal (/dev/tty), so REQUIRE one. We test
+# /dev/tty rather than stdout because in --emit mode stdout is a capture pipe
+# (sel="$(baton --emit)"), so a stdout test would wrongly reject the normal case.
+if ! { : >/dev/tty; } 2>/dev/null; then
   echo "$PROG needs a terminal. From another machine run:  ssh -t <host> $PROG" >&2
   exit 1
 fi
 
-show_all=0
-case "${1:-}" in
-  -a|--all) show_all=1 ;;
-esac
-
 rows=$(_scan list "$show_all")
 
 if [ -z "$rows" ]; then
-  echo "No claude/codex sessions found."
+  # On stderr so --emit's stdout stays empty (the function treats that as a no-op).
+  echo "No claude/codex sessions found." >&2
   exit 0
 fi
 
@@ -382,24 +441,43 @@ sel=$(printf '%s\n' "$rows" | fzf \
 # Parse the chosen TSV line. Fields 1 (path) and 7 (display) are consumed only
 # by fzf (preview callback / display column), so they're discarded here as `_`.
 IFS=$'\t' read -r _ tool id cwd active pids _ <<<"$sel"
-# Folder header rows have no id — selecting one just exits cleanly.
+# Folder header rows have no id — selecting one exits cleanly with no stdout, so
+# the shell function treats it as a no-op.
 [ -z "$id" ] && exit 0
 
-# If live, confirm and end the existing process so work can't diverge.
+# If live, confirm and end the existing process so work can't diverge. All of
+# this is user interaction → route to /dev/tty so --emit's stdout stays clean
+# (only the final metadata line may land on stdout).
 if [ "$active" = "1" ] && [ -n "$pids" ]; then
-  echo "This session is LIVE (pid(s): $pids) in: $cwd"
-  printf "End that process and resume here? [y/N] "
-  read -r ans
+  {
+    echo "This session is LIVE (pid(s): $pids) in: $cwd"
+    printf "End that process and resume here? [y/N] "
+  } >/dev/tty
+  read -r ans </dev/tty
   case "$ans" in
     y|Y) for p in ${pids//,/ }; do kill "$p" 2>/dev/null; done; sleep 1 ;;
-    *)   echo "cancelled"; exit 0 ;;
+    *)   echo "cancelled" >/dev/tty; exit 0 ;;
   esac
 fi
 
+# --emit: hand the selection back to the shell function, which does the cd +
+# resume IN your shell (so you end up in $cwd). Nothing else on stdout.
+if [ "$emit" = "1" ]; then
+  printf '%s\t%s\t%s\n' "$tool" "$id" "$cwd"
+  exit 0
+fi
+
+# Fallback (bare binary, no shell function in play — e.g. fresh `ssh -t host
+# baton`): cd then exec resume. Resume works, but the parent shell can't be
+# moved from a child, so it stays put. Install the shell integration
+# (`eval "$(baton shell-init bash)"`) to be left in $cwd after the session.
+# Plain `exec claude`/`exec codex` (NOT `exec command claude`): in exec position
+# `command` is a program name, not the builtin — relying on /usr/bin/command
+# existing is a portability trap (absent on many Linux boxes).
 cd "$cwd" 2>/dev/null || { echo "$PROG: cannot cd to $cwd" >&2; exit 1; }
-echo "Resuming $tool in $cwd …"
+echo "Resuming $tool in $cwd …" >&2
 if [ "$tool" = "claude" ]; then
-  exec command claude --resume "$id"
+  exec claude --resume "$id"
 else
-  exec command codex resume "$id"
+  exec codex resume "$id"
 fi
