@@ -30,9 +30,17 @@ Copies the script to `~/.local/share/baton`, links `baton` into `~/.local/bin`
 (plus an `agents` alias), and is **self-contained** afterward (no checkout
 required). Re-run any time to update.
 
+The installer also **wires shell integration** automatically: it adds a managed,
+idempotent block (`eval "$(baton shell-init …)"`) to each of `~/.zshrc`,
+`~/.bashrc`, `~/.bash_profile` that exists, so `baton` becomes a shell function.
+That's what lets baton leave you **in the session's project directory** after the
+session ends (see [Usage](#usage)). Open a new terminal (or `source` your rc) once
+after installing. Pass `--no-modify-rc` to skip this — baton still resumes, it
+just can't move your shell; the line to add yourself is printed instead.
+
 Install from a local checkout instead with
 `scripts/install.sh --from-source PATH`. Override locations with
-`BATON_INSTALL_DIR` / `BATON_BIN_DIR`.
+`BATON_INSTALL_DIR` / `BATON_BIN_DIR`, or the rc target with `BATON_RC_FILE`.
 
 ### Requirements
 
@@ -67,8 +75,27 @@ A `●` marks a session with a **live** process. Resuming a live session prompts
 end that process first, so the same conversation isn't driven from two places at
 once.
 
-> The `agents` command is installed as an alias for `baton`, so existing muscle
-> memory keeps working.
+### You land in the project directory afterward
+
+With shell integration installed (the default — see [Install](#install)), `baton`
+runs as a shell function: it `cd`s your shell into the picked session's directory,
+resumes, and when the session ends **your shell is still in that directory**. No
+more getting dropped back at `~` and having to re-navigate to resume again — just
+run `baton` again, or `claude --resume` right where you are.
+
+This needs a shell function because a normal command is a *child process* and a
+child can't change its parent shell's directory; only code running **in** your
+shell can. The installer wires that one line for you. Without the integration
+(e.g. `ssh -t host baton` on a box that wasn't set up, or after `--no-modify-rc`),
+baton still lists and resumes — it just can't move your shell, so you land back
+where you started.
+
+> The `agents` command is installed as an alias for `baton` (a matching `agents`
+> shell function is defined too), so existing muscle memory keeps working.
+
+> **Note:** if you `Ctrl-Z` (suspend) *during* a resumed session, the shell may
+> leave it as a stopped background job rather than returning cleanly — you're
+> still left in the right directory. Normal exit is unaffected.
 
 ## How it works
 
