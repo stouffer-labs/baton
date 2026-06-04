@@ -30,8 +30,8 @@ EOF
 }
 
 OWNER="${GITHUB_OWNER:-stouffer-labs}"
-# Repo name is fixed: the local source dir is "Agents-menu" but the published
-# repo is "baton". Override with --repo if ever needed.
+# Repo name is fixed (not derived from the local dir, which is "Baton" with a
+# capital B) so the published repo stays lowercase "baton". Override with --repo.
 REPO="baton"
 BRANCH="main"
 DRY_RUN=0
