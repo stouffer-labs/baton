@@ -2144,8 +2144,10 @@ fi
 
 SELFq=$(printf '%q' "$SELF")
 
-BATON_STATE="$(mktemp -t baton-state.XXXXXX)" && [ -n "$BATON_STATE" ] || {
-  echo "$PROG: cannot create a temporary state file" >&2; exit 1; }
+if ! BATON_STATE="$(mktemp -t baton-state.XXXXXX)" || [ -z "$BATON_STATE" ]; then
+  echo "$PROG: cannot create a temporary state file" >&2
+  exit 1
+fi
 export BATON_STATE
 # The folder baton was launched from floats to the top of the list.
 BATON_ORIGIN="$PWD"
