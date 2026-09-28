@@ -101,16 +101,22 @@ wire_rc() {
 
   if grep -qF "$RC_BEGIN" "$rc_file" 2>/dev/null; then
     # Replace the existing managed block in place.
+    # The block goes in through ENVIRON, not `awk -v`: BSD awk (macOS) rejects
+    # a newline inside a -v value. The rc is only rewritten when awk succeeded
+    # AND produced output, so a failure can never truncate someone's rc file.
     local tmp_rc
     tmp_rc="$(mktemp -t baton-rc.XXXXXX)"
-    awk -v b="$RC_BEGIN" -v e="$RC_END" -v repl="$block" '
-      $0==b {inblk=1; print repl; next}
-      inblk && $0==e {inblk=0; next}
-      !inblk {print}
-    ' "$rc_file" >"$tmp_rc"
-    cat "$tmp_rc" >"$rc_file"
+    if BATON_RC_BLOCK="$block" awk -v b="$RC_BEGIN" -v e="$RC_END" '
+         $0==b {inblk=1; print ENVIRON["BATON_RC_BLOCK"]; next}
+         inblk && $0==e {inblk=0; next}
+         !inblk {print}
+       ' "$rc_file" >"$tmp_rc" && [[ -s "$tmp_rc" ]]; then
+      cat "$tmp_rc" >"$rc_file"
+      echo "updated baton integration in ${rc_file}"
+    else
+      echo "warn: could not update the baton block in ${rc_file}; left it unchanged" >&2
+    fi
     rm -f "$tmp_rc"
-    echo "updated baton integration in ${rc_file}"
   else
     # Append, ensuring a separating blank line if the file already has content.
     # Decide on the separator BEFORE opening the file for append (don't stat and
