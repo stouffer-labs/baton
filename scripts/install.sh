@@ -147,10 +147,13 @@ collect_rc_targets() {
 }
 
 # Runtime needs python3 and fzf; warn (don't fail) if fzf is missing at install
-# time so the curl|bash flow still completes on a fresh box.
+# time so the curl|bash flow still completes on a fresh box. ripgrep is optional
+# (only the type-to-search content search uses it) so it's a soft suggestion.
 need_cmd python3
 command -v fzf >/dev/null 2>&1 || \
   echo "warn: fzf not found — install it before running 'baton' (brew install fzf / apt install fzf)"
+command -v rg >/dev/null 2>&1 || \
+  echo "note: ripgrep (rg) not found — optional, enables type-to-search over session contents (brew install ripgrep / apt install ripgrep)"
 
 # Resolve the baton script: from a local checkout, or downloaded from GitHub.
 tmp_dir=""
