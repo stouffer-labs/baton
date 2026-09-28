@@ -1931,5 +1931,53 @@ class PickerFlowTests(KillTests):
             os.waitpid(pid, 0)
 
 
+
+class InstallerTests(BatonCase):
+    """scripts/install.sh rc wiring, in a sandbox HOME (never the real rc)."""
+
+    def install(self, rc, extra_path=None):
+        env = {'HOME': str(self.home), 'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+               'BATON_INSTALL_DIR': str(self.home / 'share'), 'BATON_BIN_DIR': str(self.home / 'bin'),
+               'BATON_RC_FILE': str(rc)}
+        if extra_path:
+            env['PATH'] = '%s:%s' % (extra_path, env['PATH'])
+        return subprocess.run(['bash', str(REPO / 'scripts' / 'install.sh'), '--from-source', str(REPO)],
+                              env=env, capture_output=True, text=True, timeout=TIMEOUT)
+
+    def test_existing_block_is_replaced_in_place_and_idempotent(self):
+        rc = self.home / 'bashrc'
+        rc.write_text('before\n# >>> baton shell integration >>>\nold line\n'
+                      '# <<< baton shell integration <<<\nafter\n')
+        for _ in range(2):
+            p = self.install(rc)
+            self.assertEqual(p.returncode, 0, p.stderr)
+        text = rc.read_text()
+        self.assertEqual(text.count('# >>> baton shell integration >>>'), 1)
+        self.assertNotIn('old line', text)
+        self.assertIn('shell-init bash', text)
+        self.assertTrue(text.startswith('before\n') and text.endswith('after\n'), text)
+
+    def test_block_is_appended_when_absent(self):
+        rc = self.home / 'zshrc'
+        rc.write_text('export A=1\n')
+        p = self.install(rc)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        text = rc.read_text()
+        self.assertTrue(text.startswith('export A=1\n'))
+        self.assertIn('shell-init zsh', text)
+
+    def test_a_failing_awk_never_truncates_the_rc(self):
+        rc = self.home / 'bashrc'
+        original = 'keep me\n# >>> baton shell integration >>>\nold\n# <<< baton shell integration <<<\n'
+        rc.write_text(original)
+        stub = self.home / 'stub-bin'
+        stub.mkdir()
+        (stub / 'awk').write_text('#!/bin/sh\nexit 2\n')
+        (stub / 'awk').chmod(0o755)
+        p = self.install(rc, extra_path=str(stub))
+        self.assertEqual(rc.read_text(), original, 'rc must be left unchanged')
+        self.assertIn('left it unchanged', p.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()
