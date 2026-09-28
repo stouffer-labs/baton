@@ -2,36 +2,43 @@
 # baton — menu of claude/codex SESSIONS to resume natively (no tmux).
 #
 # Pass the baton: start a session on one machine, pick it up on another over SSH.
-# Lists sessions grouped by the directory they were started in, newest first.
-# By default shows only ACTIVE sessions (a live claude/codex process exists);
-# pass -a/--all to include closed ones. Selecting a session:
-#   * if it is live, kills that process (after confirmation) so the work can't
-#     diverge between two machines,
-#   * cd's to the session's original directory (required: resume is cwd-scoped),
+# Only the ROOT sessions you drove yourself are listed, titled the way
+# `claude --resume` / `codex resume` title them. Hidden by default:
+#   * automated runs (Agent SDK / `claude -p` / `codex exec`) —
+#     ctrl-a shows them,
+#   * subagents (Claude Task-tool agents, Codex spawned/guardian threads) — they
+#     fold under their parent (`⤷N`); → unfolds, ← folds,
+#   * superseded sessions (a `continued-in` predecessor) — ctrl-a shows them.
+# Default "Open + Recent" view (empty query): pin every live session (`●`), then
+# fill the terminal with the most recent closed ones, grouped by the directory
+# each was started in; the folder you launched from floats up. + (or =) expands
+# the hovered folder; type to search names + content; ctrl-t cycles the tool.
+# Selecting a session:
+#   * if it is live AND baton can prove which process holds it (Claude's
+#     ~/.claude/sessions/<pid>.json registry, Codex's thread-writer lock), offers
+#     to end that process first so the work can't diverge between machines,
+#   * cd's to the session's original directory (resume is cwd-scoped),
 #   * runs `claude --resume <id>` / `codex resume <id>` NATIVELY in this terminal.
-#
-# Because nothing runs under tmux, mouse select / copy-paste / scroll are fully
-# native on both Mac and Windows-SSH. Installs as `baton` (with `agents` as a
-# backward-compatible alias).
 #
 # SHELL INTEGRATION (installed for you): the installer adds
 #   eval "$(baton shell-init bash)"   # or zsh
 # to your rc, which defines a `baton` shell FUNCTION. The function cd's your REAL
 # shell to the session dir, then resumes — so when the session ends you are left
-# IN the project directory (instead of back at ~). The function calls
-# `baton --emit`, which runs the picker + live-handling and prints the chosen
-# `tool<TAB>id<TAB>cwd` on stdout for the function to act on. Run as a bare binary
-# with no function in play, baton falls back to cd + exec resume (resume works
-# everywhere; only then does your shell stay put).
+# IN the project directory. It calls `baton --emit`, which runs the picker +
+# live-handling and prints the chosen `tool<TAB>id<TAB>cwd` for the function.
 #
-# Usage:  baton [-a|--all]
-#         baton shell-init [bash|zsh]   # print the shell function (for eval)
-#         baton --emit [-a|--all]       # internal: print selection, don't resume
+# Usage:  baton [--tool both|claude|codex] [-a|--all]
+#         baton shell-init [bash|zsh]         # print the shell function (for eval)
+#         baton --stats | --dump              # session counts / full index as JSON
+#         baton --emit [--tool X]             # internal: print selection, don't resume
 # Run from Windows with:  ssh -t <mac-host> baton
+#
+# Bash here stays 3.2-compatible (stock macOS /bin/bash): no associative arrays,
+# no ${v,,}, no mapfile.
 
 set -uo pipefail
 
-# Absolute path to self, for the fzf preview callback.
+# Absolute path to self, for the fzf callbacks.
 case $0 in
   /*) SELF=$0 ;;
   *)  SELF=$(command -v "$0" 2>/dev/null || echo "$PWD/$0") ;;
@@ -40,318 +47,1896 @@ esac
 PROG=$(basename "$SELF")
 
 # --- embedded scanner -------------------------------------------------------
-# _scan list <show_all 0|1>     -> TSV rows
-# _scan preview <path> <tool>   -> human-readable tail of a session
+# _scan dump | stats                  -> JSON (all sessions / counts by kind)
+# _scan render <height> [initial]     -> TSV rows for the current UI state
+# _scan preview <path> <tool> <card>  -> description card + readable transcript
+# _scan kill-check <tool> <id> [us]   -> may baton end this session's process?
+# _scan kill <tool> <id> <pids>       -> re-validate, SIGTERM, wait until gone
 _scan() {
   python3 - "$@" <<'PY'
-import json, os, glob, subprocess, sys, time
+import json, os, re, sys, time, subprocess, tempfile, unicodedata
+from urllib.parse import quote, unquote
 
 HOME = os.path.expanduser('~')
-mode = sys.argv[1] if len(sys.argv) > 1 else 'list'
+CLAUDE_PROJECTS = os.path.join(HOME, '.claude', 'projects')
+CLAUDE_SESSIONS = os.path.join(HOME, '.claude', 'sessions')
+CODEX_HOME = os.path.join(HOME, '.codex')
+CODEX_LOCKS = os.path.join(CODEX_HOME, 'thread-writer-locks')
 
-# ---------- shared helpers ----------
+# Bump RULES_VERSION whenever parsing/classification rules change: it
+# invalidates every cached fact. CACHE_SCHEMA covers the file layout.
+RULES_VERSION = 4
+CACHE_SCHEMA = 1
+WIN = 65536          # Claude's /resume reads the first and last 64 KB of a file
+CARD_H = 7           # preview card height (kept sticky with --preview-window ~7)
+KINDS = ('root', 'automated', 'child', 'superseded', 'empty')
+SHOWN = ('root',)
+SHOWN_ALL = ('root', 'automated', 'superseded')
+
+# ---------- sanitization (untrusted text never reaches the terminal raw) ----------
+_ESC_RE = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]'          # CSI
+                     r'|\][^\x07\x1b]*(?:\x07|\x1b\\)?'      # OSC
+                     r'|[PX^_][^\x1b]*(?:\x1b\\)?'           # DCS / SOS / PM / APC
+                     r'|[@-Z\\-_])')                         # other 2-byte escapes
+_CTRL_RE = re.compile(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]')      # keeps \t \n until below
+
+def clean_text(s):
+    """Multi-line text for the preview: escapes and C0/C1 controls removed,
+    newlines kept, tabs expanded."""
+    if not s:
+        return ''
+    s = _ESC_RE.sub('', str(s))
+    s = s.replace('\r\n', '\n').replace('\r', '\n').replace('\t', '    ')
+    return _CTRL_RE.sub('', s)
+
+def clean_line(s):
+    """Single-line text for list rows / TSV fields / titles."""
+    return ' '.join(clean_text(s).split())
+
+def tsv(s):
+    return str(s or '').replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+
+def _cw(ch):
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+
+def fit(s, width):
+    """Truncate to a terminal DISPLAY width (wide CJK chars count 2)."""
+    if width <= 0:
+        return ''
+    if sum(_cw(c) for c in s) <= width:
+        return s
+    out, w = [], 0
+    for ch in s:
+        cw = _cw(ch)
+        if w + cw > width - 1:
+            break
+        out.append(ch)
+        w += cw
+    return ''.join(out) + '…'
+
+# ---------- small helpers ----------
 def ago(sec):
+    if not sec:
+        return '?'
     d = max(0, time.time() - sec)
     if d < 60:    return "%ds" % int(d)
-    if d < 3600:  return "%dm" % int(d/60)
-    if d < 86400: return "%dh" % int(d/3600)
-    return "%dd" % int(d/86400)
+    if d < 3600:  return "%dm" % int(d / 60)
+    if d < 86400: return "%dh" % int(d / 3600)
+    return "%dd" % int(d / 86400)
 
-def first_real_text(text):
-    t = (text or "").strip()
-    if not t: return None
-    if t.startswith('<'): return None              # system/caveat/reminder blocks
-    low = t[:40].lower()
-    if low.startswith('caveat') or 'instructions' in low: return None
-    return ' '.join(t.split())[:90]
+def parse_iso(s):
+    if not s or not isinstance(s, str):
+        return 0.0
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()
+    except ValueError:
+        return 0.0
 
-# ---------- live process detection ----------
-def proc_cwd(pid):
-    """Working directory of a pid. Linux: read /proc/<pid>/cwd (instant).
-    macOS / no-proc: fall back to lsof. Returns None if undeterminable."""
-    # Linux fast path: /proc/<pid>/cwd is a symlink to the process cwd.
-    link = '/proc/%s/cwd' % pid
+def human_size(n):
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if n < 1024 or unit == 'GB':
+            return ('%d %s' % (n, unit)) if unit == 'B' else ('%.1f %s' % (n, unit))
+        n /= 1024.0
+
+def tilde(p):
+    if p == HOME:
+        return '~'
+    if p.startswith(HOME + '/'):
+        return '~' + p[len(HOME):]
+    return p
+
+# ---------- raw JSON field extraction (mirrors Claude's lite /resume reader) ----------
+# Claude writes compact JSON; fixtures and other writers may add spaces, so all
+# byte-level probes tolerate whitespace around the colon.
+_FRE = {}
+def _fre(key):
+    r = _FRE.get(key)
+    if r is None:
+        r = _FRE[key] = re.compile(rb'"' + re.escape(key.encode()) + rb'"\s*:\s*"((?:[^"\\]|\\.)*)"')
+    return r
+
+def _jstr(b):
+    try:
+        return json.loads(b'"' + b + b'"')
+    except ValueError:
+        return b.decode('utf-8', 'replace')
+
+def raw_prefix(buf, key, n=300):
+    """Best-effort start of a JSON string value that may be cut off by the
+    64 KB window (an SDK prompt carrying a whole diff is one huge line)."""
+    m = re.search(rb'"' + re.escape(key.encode()) + rb'"\s*:\s*"', buf or b'')
+    if not m:
+        return None
+    raw = (buf[m.end():m.end() + 4 * n]).decode('utf-8', 'replace')
+    q = re.search(r'(?<!\\)(?:\\\\)*"', raw)
+    if q:
+        raw = raw[:q.end() - 1]
+    raw = re.sub(r'\\(u[0-9a-fA-F]{0,3})?$', '', raw)
+    try:
+        val = json.loads('"' + raw + '"')
+    except ValueError:
+        val = raw.replace('\\n', ' ').replace('\\t', ' ').replace('\\"', '"')
+    return clean_line(val)[:n] or None
+
+def first_str(buf, key):
+    if not buf:
+        return None
+    m = _fre(key).search(buf)
+    return _jstr(m.group(1)) if m else None
+
+def last_str(buf, key):
+    if not buf:
+        return None
+    last = None
+    for m in _fre(key).finditer(buf):
+        last = m
+    return _jstr(last.group(1)) if last else None
+
+RE_SIDECHAIN = re.compile(rb'"isSidechain"\s*:\s*true')
+RE_TEAM = re.compile(rb'"teamName"\s*:\s*"')
+RE_PARENT = re.compile(rb'"parentUuid"\s*:')
+RE_T_USER = re.compile(rb'"type"\s*:\s*"user"')
+RE_T_CONV = re.compile(rb'"type"\s*:\s*"(?:user|assistant)"')
+RE_T_SUMMARY = re.compile(rb'"type"\s*:\s*"summary"')
+RE_T_CONT = re.compile(rb'"type"\s*:\s*"continued-in"')
+RE_ROLE_USER = re.compile(rb'"role"\s*:\s*"user"')
+
+def read_windows(path):
+    """(st, head, tail, full, stable). Files <= 128 KB are read whole (full=True,
+    tail=b''); bigger ones as a 64 KB head + 64 KB tail. Stat before and after;
+    retry once if the file changed underneath us."""
+    res = None
+    for _ in (0, 1):
+        try:
+            st1 = os.stat(path)
+            with open(path, 'rb') as fh:
+                if st1.st_size <= 2 * WIN:
+                    head, tail, full = fh.read(), b'', True
+                else:
+                    head = fh.read(WIN)
+                    fh.seek(st1.st_size - WIN)
+                    tail, full = fh.read(WIN), False
+            st2 = os.stat(path)
+        except OSError:
+            return None
+        stable = (st1.st_size, st1.st_mtime_ns) == (st2.st_size, st2.st_mtime_ns)
+        res = (st2, head, tail, full, stable)
+        if stable:
+            break
+    return res
+
+def complete(head, tail, full):
+    """Trim windows to whole lines: drop a torn last line (file being written)
+    and, for the tail, the partial first line. Returns (headbuf, tailbuf,
+    head_lines, tail_lines)."""
+    if full:
+        cut = head.rfind(b'\n') + 1
+        hb = head[:cut]
+        return hb, b'', hb.split(b'\n')[:-1], []
+    hb = head[:head.rfind(b'\n') + 1]
+    nl = tail.find(b'\n')
+    tb = tail[nl + 1:tail.rfind(b'\n') + 1] if nl >= 0 else b''
+    return hb, tb, hb.split(b'\n')[:-1], tb.split(b'\n')[:-1]
+
+# ---------- Claude ----------
+UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+SDK_ENTRY = ('sdk-py', 'sdk-ts', 'sdk-cli')
+SKIP_RE = re.compile(r'^(?:\s*<[a-z][\w-]*[\s>]|\[Request interrupted by user[^\]]*\])')
+BLOCK_RE = re.compile(r'<(system-reminder|ide_opened_file|ide_selection)>.*?</\1>', re.S)
+CMD_RE = re.compile(r'<command-name>(.*?)</command-name>', re.S)
+ARGS_RE = re.compile(r'<command-args>(.*?)</command-args>', re.S)
+BASH_RE = re.compile(r'<bash-input>(.*?)</bash-input>', re.S)
+# Built-in slash commands are not a session "name" (Claude remembers them only
+# as a last resort); custom commands / skills with args are.
+BUILTIN_CMDS = frozenset((
+    'add-dir', 'agents', 'bashes', 'branch', 'btw', 'bug', 'clear', 'compact', 'config', 'context',
+    'cost', 'doctor', 'effort', 'exit', 'export', 'fast', 'feedback', 'fork', 'help', 'hooks',
+    'ide', 'init', 'install-github-app', 'keybindings', 'login', 'logout', 'mcp',
+    'memory', 'migrate-installer', 'model', 'output-style', 'permissions', 'plan',
+    'plugin', 'plugins', 'pr-comments', 'privacy-settings', 'quit', 'release-notes',
+    'reload-plugins', 'remote-control',
+    'rename', 'resume', 'review', 'rewind', 'sandbox', 'security-review', 'skills',
+    'stats', 'status', 'statusline', 'tasks', 'terminal-setup', 'theme', 'todos',
+    'upgrade', 'usage', 'vim'))
+
+def _prompt(t, n=300):
+    return clean_line(BLOCK_RE.sub('', t or ''))[:n]
+
+def _claude_msg_text(d):
+    msg = d.get('message')
+    c = msg.get('content') if isinstance(msg, dict) else None
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return '\n'.join(p['text'] for p in c
+                         if isinstance(p, dict) and p.get('type') == 'text' and isinstance(p.get('text'), str))
+    return ''
+
+def claude_first_prompt(lines):
+    """Claude's first-real-prompt rule over complete head lines.
+    Returns (prompt, is_loop, builtin_fallback)."""
+    fallback, seen, loop = None, False, False
+    for ln in lines:
+        if not RE_T_USER.search(ln) or b'"tool_result"' in ln:
+            continue
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue
+        if not isinstance(d, dict) or d.get('type') != 'user' or d.get('isMeta') or d.get('isCompactSummary'):
+            continue
+        text = _claude_msg_text(d)
+        if not seen:
+            seen = True
+            loop = '<command-name>/loop</command-name>' in text
+        t = text.strip()
+        if not t:
+            continue
+        m = CMD_RE.search(t)
+        if m:
+            name = m.group(1).strip().lstrip('/')
+            am = ARGS_RE.search(t)
+            args = am.group(1).strip() if am else ''
+            if args and name not in BUILTIN_CMDS:
+                return _prompt('/%s %s' % (name, args)), loop, fallback
+            if fallback is None and name:
+                fallback = '/' + name
+            continue
+        m = BASH_RE.search(t)
+        if m:
+            return _prompt('! ' + m.group(1).strip()), loop, fallback
+        if SKIP_RE.match(t):
+            continue
+        p = _prompt(t)
+        if p:
+            return p, loop, fallback
+    return '', loop, fallback
+
+def claude_facts(path):
+    """Per-file primitives (cached). Classification happens later."""
+    r = read_windows(path)
+    if r is None:
+        return None
+    st, head, tail, full, stable = r
+    hb, tb, hl, tl = complete(head, tail, full)
+    last_buf = hb if full else tb          # "last occurrence" = tail, else head
+    f = {'stable': stable}
+    f['entrypoint'] = first_str(hb, 'entrypoint') or last_str(tb, 'entrypoint') or ''
+    f['sidechain'] = bool(RE_SIDECHAIN.search(hb))
+    f['team'] = bool(RE_TEAM.search(hb))
+    sk = ''
+    for ln in head.split(b'\n'):           # first line with parentUuid (may be partial)
+        if RE_PARENT.search(ln):
+            sk = first_str(ln, 'sessionKind') or ''
+            break
+    f['session_kind'] = sk
+    f['custom_title'] = last_str(last_buf, 'customTitle') or (None if full else last_str(hb, 'customTitle'))
+    f['ai_title'] = last_str(last_buf, 'aiTitle') or (None if full else last_str(hb, 'aiTitle'))
+    summ = cont = None
+    for ln in (hl if full else tl):
+        if RE_T_SUMMARY.search(ln) or RE_T_CONT.search(ln):
+            try:
+                d = json.loads(ln)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            if d.get('type') == 'summary' and isinstance(d.get('summary'), str):
+                summ = d['summary']
+            elif d.get('type') == 'continued-in' and isinstance(d.get('continuedInSessionId'), str):
+                cont = d['continuedInSessionId']
+    f['summary'] = summ
+    f['continued_in'] = cont
+    f['last_prompt'] = last_str(last_buf, 'lastPrompt')
+    first, loop, cmdfb = claude_first_prompt(hl)
+    if not first and not full and f['entrypoint'] not in SDK_ENTRY:
+        # The first real prompt often sits on a line longer than the 64 KB head
+        # (a pasted screenshot is base64 inline). Interactive sessions only:
+        # read whole lines from the start, bounded.
+        first2, loop2, cmdfb2 = claude_first_prompt(_head_lines(path, 16 * 1024 * 1024, 400))
+        if first2:
+            first, loop, cmdfb = first2, loop or loop2, cmdfb or cmdfb2
+    f['first_prompt'], f['loop'], f['cmd_fallback'] = first, loop, cmdfb
+    raw = None
+    if not first and not full:
+        # Only the record the 64 KB head cut off, and only if it reads like a
+        # real prompt (same skip rules as above).
+        cut = head[len(hb):]
+        raw = raw_prefix(cut, 'content') or raw_prefix(cut, 'text')
+        if raw and SKIP_RE.match(raw):
+            raw = None
+    f['raw_prompt'] = raw
+    f['cwd'] = first_str(hb, 'cwd') or last_str(tb, 'cwd') or ''
+    f['branch'] = last_str(last_buf, 'gitBranch') or first_str(hb, 'gitBranch') or ''
+    f['created'] = parse_iso(first_str(hb, 'timestamp'))
+    # Claude treats a file as having messages if "parentUuid" appears; a big
+    # file we only sampled is assumed to (Claude scans further to decide).
+    f['has_msgs'] = bool(RE_PARENT.search(hb) or RE_PARENT.search(tb)) or not full
+    # "empty" only when we saw the WHOLE file and it has no conversation turn.
+    f['empty'] = full and not any(RE_T_CONV.search(ln) for ln in hl)
+    return f
+
+def _head_lines(path, max_bytes, max_lines):
+    """Whole lines from the start of a file (no 64 KB cut), bounded; a line
+    that would cross max_bytes ends the scan."""
+    out, total = [], 0
+    try:
+        with open(path, 'rb') as fh:
+            while len(out) < max_lines and total < max_bytes:
+                ln = fh.readline(max_bytes - total)
+                if not ln or not ln.endswith(b'\n'):
+                    break
+                total += len(ln)
+                out.append(ln[:-1])
+    except OSError:
+        pass
+    return out
+
+CLAUDE_CARRY = ('custom_title', 'ai_title', 'summary', 'last_prompt', 'entrypoint', 'cwd', 'branch')
+
+def meta_facts(path):
+    try:
+        with open(path) as fh:
+            d = json.load(fh)
+        if not isinstance(d, dict):
+            d = {}
+    except (OSError, ValueError):
+        d = {}
+    return {'agent_type': str(d.get('agentType') or ''), 'description': str(d.get('description') or ''),
+            'stable': True}
+
+# ---------- Codex ----------
+CODEX_INJECTED = ('<environment_context>', '<user_instructions>', '# AGENTS.md instructions',
+                  '<permissions instructions>', '<skills_instructions>', '<turn_aborted>',
+                  '<user_shell_command>', '<user_action>')
+CODEX_NEED = ('id', 'rollout_path', 'source', 'cwd', 'archived', 'preview', 'updated_at', 'created_at')
+CODEX_OPT = ('name', 'git_branch', 'agent_nickname', 'agent_role', 'updated_at_ms', 'created_at_ms')
+
+def codex_msg(d):
+    """(role, text) of a Codex conversation message record, else (None, None).
+    Only real user/assistant messages — never developer/system."""
+    if not isinstance(d, dict):
+        return None, None
+    p = d.get('payload') if d.get('type') == 'response_item' else d
+    if not isinstance(p, dict) or p.get('type') != 'message' or p.get('role') not in ('user', 'assistant'):
+        return None, None
+    c = p.get('content')
+    if isinstance(c, str):
+        t = c
+    elif isinstance(c, list):
+        t = '\n'.join(q['text'] for q in c if isinstance(q, dict) and isinstance(q.get('text'), str))
+    else:
+        return None, None
+    return p['role'], t
+
+def codex_user_text(d):
+    role, t = codex_msg(d)
+    if role != 'user':
+        return None
+    t = (t or '').strip()
+    if not t or t.startswith(CODEX_INJECTED):
+        return None
+    return t
+
+def codex_rollout_facts(path):
+    f = {'id': None, 'cwd': '', 'source': None, 'parent': None, 'branch': '', 'created': 0.0,
+         'first_prompt': '', 'last_prompt': '', 'agent': ''}
+    try:
+        st1 = os.stat(path)
+        with open(path, 'rb') as fh:
+            first = fh.readline(8 * 1024 * 1024)
+            try:
+                d = json.loads(first)
+            except ValueError:
+                d = {}
+            if isinstance(d, dict) and d.get('type') == 'session_meta' and isinstance(d.get('payload'), dict):
+                p = d['payload']
+                f['id'] = p.get('id') if isinstance(p.get('id'), str) else None
+                f['cwd'] = p.get('cwd') if isinstance(p.get('cwd'), str) else ''
+                f['source'] = p.get('source')
+                f['parent'] = p.get('parent_thread_id') if isinstance(p.get('parent_thread_id'), str) else None
+                f['agent'] = p.get('agent_nickname') if isinstance(p.get('agent_nickname'), str) else ''
+                g = p.get('git')
+                if isinstance(g, dict) and isinstance(g.get('branch'), str):
+                    f['branch'] = g['branch']
+                f['created'] = parse_iso(p.get('timestamp') or d.get('timestamp'))
+            n, seen = 0, len(first)
+            for ln in fh:
+                n += 1
+                seen += len(ln)
+                if n > 3000 or seen > 16 * 1024 * 1024:
+                    break
+                if not RE_ROLE_USER.search(ln):
+                    continue
+                try:
+                    t = codex_user_text(json.loads(ln))
+                except ValueError:
+                    continue
+                if t:
+                    f['first_prompt'] = clean_line(t)[:300]
+                    break
+            size = os.fstat(fh.fileno()).st_size
+            fh.seek(max(0, size - WIN))
+            tail = fh.read(WIN)
+        tl = tail.split(b'\n')
+        if size > WIN:
+            tl = tl[1:]
+        if not tail.endswith(b'\n'):
+            tl = tl[:-1]
+        for ln in reversed(tl):
+            if not RE_ROLE_USER.search(ln):
+                continue
+            try:
+                t = codex_user_text(json.loads(ln))
+            except ValueError:
+                continue
+            if t:
+                f['last_prompt'] = clean_line(t)[:300]
+                break
+        st2 = os.stat(path)
+        f['stable'] = (st1.st_size, st1.st_mtime_ns) == (st2.st_size, st2.st_mtime_ns)
+    except OSError:
+        return None
+    return f
+
+CODEX_CARRY = ('last_prompt', 'first_prompt')
+
+def codex_classify(src):
+    """-> (kind, reason, parent, agent). Unknown sources stay hidden."""
+    if isinstance(src, str):
+        s = src.strip()
+        if s.startswith('{'):
+            try:
+                src = json.loads(s)
+            except ValueError:
+                return 'automated', 'unknown-source', None, ''
+        elif s in ('cli', 'vscode'):
+            return 'root', '', None, ''
+        elif s in ('exec', 'mcp'):
+            return 'automated', s, None, ''
+        else:
+            return 'automated', 'unknown-source', None, ''
+    if isinstance(src, dict) and 'subagent' in src:
+        sub = src['subagent']
+        if isinstance(sub, str):
+            return 'child', sub if sub in ('review', 'compact') else 'other', None, sub
+        if isinstance(sub, dict):
+            ts = sub.get('thread_spawn')
+            if 'thread_spawn' in sub:
+                ts = ts if isinstance(ts, dict) else {}
+                parent = ts.get('parent_thread_id') if isinstance(ts.get('parent_thread_id'), str) else None
+                agent = ts.get('agent_nickname') or ts.get('agent_role') or ''
+                return 'child', 'thread_spawn', parent, agent if isinstance(agent, str) else ''
+            if 'other' in sub:
+                o = sub.get('other')
+                if o == 'guardian':
+                    return 'child', 'guardian', None, 'guardian'
+                return 'child', 'other', None, o if isinstance(o, str) else ''
+            for k in ('review', 'compact'):
+                if k in sub:
+                    return 'child', k, None, k
+        return 'child', 'other', None, ''
+    return 'automated', 'unknown-source', None, ''
+
+def codex_db():
+    """-> (rows | None, edges, warning). Rows None means "use the rollout
+    fallback" (no DB, or a DB we can't trust)."""
+    cands = []
+    try:
+        for n in os.listdir(CODEX_HOME):
+            m = re.match(r'^state_(\d+)\.sqlite$', n)
+            if m:
+                cands.append((int(m.group(1)), os.path.join(CODEX_HOME, n)))
+    except OSError:
+        return None, {}, None
+    if not cands:
+        return None, {}, None
+    path = max(cands)[1]                   # numeric: state_10 beats state_9
+    try:
+        import sqlite3
+        # mode=ro (never immutable=1: Codex writes this DB while we read it)
+        con = sqlite3.connect('file:%s?mode=ro' % quote(path), uri=True, timeout=2)
+        try:
+            cols = {r[1] for r in con.execute('PRAGMA table_info(threads)')}
+            if not all(c in cols for c in CODEX_NEED):
+                return None, {}, 'codex state DB unsupported — archived filter unavailable'
+            sel = list(CODEX_NEED) + [c for c in CODEX_OPT if c in cols]
+            rows = [dict(zip(sel, r)) for r in
+                    con.execute('SELECT %s FROM threads WHERE archived = 0' % ', '.join(sel))]
+            edges = {}
+            try:
+                for p, c in con.execute('SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges'):
+                    edges[c] = p
+            except sqlite3.Error:
+                pass
+            return rows, edges, None
+        finally:
+            con.close()
+    except Exception as e:
+        return None, {}, 'codex state DB unreadable (%s) — archived filter unavailable' % type(e).__name__
+
+def codex_rollout_paths():
+    root = os.path.join(CODEX_HOME, 'sessions')
+    out = []
+    for dp, dns, fns in os.walk(root):
+        for fn in fns:
+            if fn.startswith('rollout-') and fn.endswith('.jsonl'):
+                out.append(os.path.join(dp, fn))
+    return out
+
+def codex_index_names():
+    names = {}
+    try:
+        with open(os.path.join(CODEX_HOME, 'session_index.jsonl')) as fh:
+            for ln in fh:
+                try:
+                    d = json.loads(ln)
+                except ValueError:
+                    continue
+                if isinstance(d, dict) and isinstance(d.get('id'), str) and isinstance(d.get('thread_name'), str):
+                    names[d['id']] = d['thread_name']      # last entry wins
+    except OSError:
+        pass
+    return names
+
+# ---------- persistent cache: parsed per-file FACTS, never conclusions ----------
+class Cache:
+    def __init__(self):
+        base = os.environ.get('XDG_CACHE_HOME') or os.path.join(HOME, '.cache')
+        self.dir = os.path.join(base, 'baton')
+        self.path = os.path.join(self.dir, 'index.json')
+        self.old, self.new, self.dirty = {}, {}, False
+        try:
+            with open(self.path) as fh:
+                d = json.load(fh)
+            if (isinstance(d, dict) and d.get('schema') == CACHE_SCHEMA
+                    and d.get('rules') == RULES_VERSION and isinstance(d.get('files'), dict)):
+                self.old = d['files']
+        except (OSError, ValueError):
+            pass
+
+    def get(self, path, st, parser, carry=()):
+        fp = [st.st_size, st.st_mtime_ns, st.st_ino]
+        e = self.old.get(path)
+        if e and e.get('fp') == fp:
+            self.new[path] = e
+            return e['facts']
+        facts = parser(path)
+        self.dirty = True
+        if facts is None:
+            return None
+        # A file that only grew (same inode) keeps its earlier good titles if
+        # this parse came up empty for them (e.g. a torn tail mid-write).
+        if e and carry and isinstance(e.get('fp'), list) and len(e['fp']) == 3 \
+                and e['fp'][2] == fp[2] and fp[0] >= e['fp'][0]:
+            for k in carry:
+                if not facts.get(k) and e['facts'].get(k):
+                    facts[k] = e['facts'][k]
+        if facts.pop('stable', True):
+            self.new[path] = {'fp': fp, 'facts': facts}
+        elif e:
+            self.new[path] = e              # file mid-write: keep the last good facts
+        return facts
+
+    def save(self):
+        if not self.dirty and len(self.new) == len(self.old):
+            return
+        tmp = None
+        try:
+            os.makedirs(self.dir, mode=0o700, exist_ok=True)
+            os.chmod(self.dir, 0o700)
+            # fzf kills a superseded reload outright, so a render can die
+            # mid-save and orphan its temp file; sweep old ones.
+            now = time.time()
+            for n in os.listdir(self.dir):
+                if n.startswith('index.') and n.endswith('.tmp'):
+                    q = os.path.join(self.dir, n)
+                    try:
+                        if now - os.stat(q).st_mtime > 120:
+                            os.unlink(q)
+                    except OSError:
+                        pass
+            fd, tmp = tempfile.mkstemp(prefix='index.', suffix='.tmp', dir=self.dir)
+            with os.fdopen(fd, 'w') as fh:
+                json.dump({'schema': CACHE_SCHEMA, 'rules': RULES_VERSION, 'files': self.new},
+                          fh, separators=(',', ':'))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.path)      # atomic; a concurrent writer only loses warm entries
+            tmp = None
+        except OSError:
+            pass
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+# ---------- index assembly ----------
+def _session(tool, sid, path, cwd, kind, reason, title, st=None, **kw):
+    s = {'tool': tool, 'id': sid, 'path': path, 'cwd': cwd or '', 'kind': kind, 'reason': reason,
+         'title': clean_line(title) or '(session)', 'first_prompt': clean_line(kw.get('first_prompt')),
+         'last_prompt': clean_line(kw.get('last_prompt')), 'branch': clean_line(kw.get('branch')),
+         'created': float(kw.get('created') or 0), 'updated': float(kw.get('updated') or 0),
+         'size': int(kw.get('size') or 0), 'parent': kw.get('parent') or '',
+         'agent_type': clean_line(kw.get('agent_type')), 'children': 0, 'child_types': {},
+         'live': '', 'pids': [], 'status': ''}
+    return s
+
+def _successor_has_msgs(cache, tops, pd, cont):
+    """Claude's rule: the successor file must exist in the SAME project folder
+    and hold messages. Checked on that exact file, not on whichever duplicate
+    of the id won the global dedupe."""
+    if not UUID_RE.match(cont or ''):
+        return False
+    sp = os.path.join(pd, cont + '.jsonl')
+    try:
+        sst = os.stat(sp)
+    except OSError:
+        return False
+    t = tops.get(cont)
+    sf = t[1] if t and t[0]['path'] == sp else cache.get(sp, sst, claude_facts, CLAUDE_CARRY)
+    return bool(sf and sf.get('has_msgs'))
+
+def claude_sessions(cache):
+    tops = {}        # sid -> (session, facts, projdir)
+    subdirs = {}     # projdir -> set(names of subdirectories)
+    children = []
+    try:
+        projects = [e for e in os.scandir(CLAUDE_PROJECTS) if e.is_dir()]
+    except OSError:
+        projects = []
+    for pd in projects:
+        try:
+            entries = list(os.scandir(pd.path))
+        except OSError:
+            continue
+        subs = set()
+        for e in entries:
+            try:
+                if e.is_dir():
+                    subs.add(e.name)
+                    continue
+                if not e.is_file() or not e.name.endswith('.jsonl') or not UUID_RE.match(e.name[:-6]):
+                    continue
+                st = e.stat()
+            except OSError:
+                continue
+            sid = e.name[:-6]
+            prev = tops.get(sid)
+            if prev and prev[0]['updated'] >= st.st_mtime:
+                continue                    # duplicate id (alias/worktree): keep newest
+            f = cache.get(e.path, st, claude_facts, CLAUDE_CARRY)
+            if f is None:
+                continue
+            s = _session('claude', sid, e.path, f.get('cwd'), 'root', '', '', updated=st.st_mtime,
+                         size=st.st_size, created=f.get('created'), branch=f.get('branch'),
+                         first_prompt=f.get('first_prompt'), last_prompt=f.get('last_prompt'))
+            tops[sid] = (s, f, pd.path)
+        subdirs[pd.path] = subs
+        for name in subs:
+            sub = os.path.join(pd.path, name, 'subagents')
+            try:
+                sents = list(os.scandir(sub))
+            except OSError:
+                continue
+            for e in sents:
+                n = e.name
+                if not (n.startswith('agent-') and n.endswith('.jsonl')):
+                    continue
+                try:
+                    st = e.stat()
+                except OSError:
+                    continue
+                children.append((name, n[6:-6], e.path, st, pd.path))
+
+    out = []
+    for sid, (s, f, pd) in tops.items():
+        custom = None
+        if sid in subdirs.get(pd, ()):
+            try:
+                with open(os.path.join(pd, sid, 'custom-title.json')) as fh:
+                    d = json.load(fh)
+                if isinstance(d, dict) and isinstance(d.get('customTitle'), str):
+                    custom = d['customTitle'].strip() or None
+            except (OSError, ValueError):
+                pass
+        title = (custom or f.get('custom_title') or f.get('ai_title') or f.get('summary')
+                 or f.get('last_prompt') or f.get('first_prompt') or f.get('cmd_fallback')
+                 or f.get('raw_prompt') or '')
+        s['title'] = clean_line(BLOCK_RE.sub('', title or '')) or '(session)'
+        ep = f.get('entrypoint') or ''
+        kind, reason = 'root', ''
+        cont = f.get('continued_in')
+        if cont and _successor_has_msgs(cache, tops, pd, cont):
+            kind, reason = 'superseded', 'continued-in:' + cont
+        elif ep in SDK_ENTRY:
+            kind, reason = 'automated', ep
+        elif f.get('sidechain'):
+            kind, reason = 'automated', 'sidechain'
+        elif f.get('team'):
+            kind, reason = 'automated', 'team'
+        elif f.get('session_kind') in ('daemon', 'daemon-worker'):
+            kind, reason = 'automated', 'daemon'
+        elif f.get('loop'):
+            kind, reason = 'automated', 'loop'
+        elif f.get('empty'):
+            kind, reason = 'empty', 'no-user-messages'
+        s['kind'], s['reason'] = kind, reason
+        out.append(s)
+
+    cwd_of = {sid: v[0]['cwd'] for sid, v in tops.items()}
+    for parent, aid, path, st, pd in children:
+        mp = path[:-6] + '.meta.json'
+        try:
+            mst = os.stat(mp)
+            m = cache.get(mp, mst, meta_facts)
+        except OSError:
+            m = None
+        m = m or {'agent_type': '', 'description': ''}
+        at = m.get('agent_type') or 'subagent'
+        title = at + (' · ' + m['description'] if m.get('description') else '')
+        out.append(_session('claude', aid, path, cwd_of.get(parent, ''), 'child', 'subagent', title,
+                            parent=parent, agent_type=at, updated=st.st_mtime, size=st.st_size))
+    return out
+
+def codex_sessions(cache, warnings):
+    out = []
+    rows, edges, warn = codex_db()
+    if warn:
+        warnings.append(warn)
+    if rows is not None:
+        for r in rows:
+            tid = r.get('id')
+            if not isinstance(tid, str):
+                continue
+            kind, reason, parent, agent = codex_classify(r.get('source'))
+            rp = r.get('rollout_path') or ''
+            facts, size = None, 0
+            try:
+                st = os.stat(rp)
+                size = st.st_size
+                facts = cache.get(rp, st, codex_rollout_facts, CODEX_CARRY)
+            except OSError:
+                pass
+            facts = facts or {}
+            if kind == 'child':
+                parent = parent or edges.get(tid) or facts.get('parent')
+                agent = agent or r.get('agent_nickname') or r.get('agent_role') or 'subagent'
+            preview = r.get('preview') or ''
+            if kind == 'root' and not preview.strip():
+                kind, reason = 'empty', 'no-user-messages'
+            upd = (r.get('updated_at_ms') or 0) / 1000.0 or float(r.get('updated_at') or 0)
+            cre = (r.get('created_at_ms') or 0) / 1000.0 or float(r.get('created_at') or 0)
+            out.append(_session('codex', tid, rp, r.get('cwd') or facts.get('cwd'), kind, reason,
+                                r.get('name') or preview, first_prompt=preview,
+                                last_prompt=facts.get('last_prompt'), branch=r.get('git_branch') or facts.get('branch'),
+                                created=cre, updated=upd, size=size, parent=parent,
+                                agent_type=agent if kind == 'child' else ''))
+        return out
+    names = codex_index_names()
+    for rp in codex_rollout_paths():
+        try:
+            st = os.stat(rp)
+        except OSError:
+            continue
+        f = cache.get(rp, st, codex_rollout_facts, CODEX_CARRY)
+        if not f or not f.get('id'):
+            continue
+        kind, reason, parent, agent = codex_classify(f.get('source'))
+        if kind == 'child':
+            parent = parent or f.get('parent')
+            agent = agent or f.get('agent') or 'subagent'
+        if kind == 'root' and not f.get('first_prompt'):
+            kind, reason = 'empty', 'no-user-messages'
+        out.append(_session('codex', f['id'], rp, f.get('cwd'), kind, reason,
+                            names.get(f['id']) or f.get('first_prompt'), first_prompt=f.get('first_prompt'),
+                            last_prompt=f.get('last_prompt'), branch=f.get('branch'), created=f.get('created'),
+                            updated=st.st_mtime, size=st.st_size, parent=parent,
+                            agent_type=agent if kind == 'child' else ''))
+    return out
+
+# ---------- live processes ----------
+# codex 0.157 `--help`: only a bare `codex`, `resume` and `fork` are the
+# interactive TUI; every other subcommand is non-interactive. A first word that
+# is none of these is a prompt (`codex "fix the bug"`), which is also the TUI.
+CODEX_TUI_SUBS = frozenset(('', 'resume', 'fork'))
+CODEX_SUBS = frozenset(('agents', 'exec', 'e', 'review', 'login', 'logout', 'mcp', 'plugin', 'app-server',
+                        'remote-control', 'app', 'completion', 'update', 'doctor', 'sandbox', 'debug',
+                        'apply', 'a', 'queue', 'archive', 'delete', 'migrate-rollouts', 'unarchive',
+                        'cloud', 'exec-server', 'features', 'help', 'mcp-server', 'proto'))
+# Long-lived servers can hold several threads: never "the" process of one.
+CODEX_DAEMONS = frozenset(('app-server', 'remote-control', 'exec-server', 'mcp-server', 'mcp', 'agents'))
+CODEX_VALUE_FLAGS = frozenset(('-c', '--config', '-m', '--model', '-p', '--profile', '-C', '--cd',
+                               '-s', '--sandbox', '-a', '--ask-for-approval', '-i', '--image',
+                               '--enable', '--disable', '--local-provider', '--add-dir', '--remote',
+                               '--remote-auth-token-env'))
+
+def proc_table():
+    """-> ({pid: {ppid, lstart, argv, cwd, open}}, test_mode). lstart is the
+    process start in UTC ('Sun Sep 27 02:56:37 2026'), the format Claude's
+    registry uses for procStart."""
+    tp = os.environ.get('BATON_TEST_PROCS')
+    if tp:
+        try:
+            with open(tp) as fh:
+                lst = json.load(fh)
+        except (OSError, ValueError):
+            lst = []
+        procs = {}
+        for p in lst if isinstance(lst, list) else []:
+            try:
+                procs[int(p['pid'])] = {'ppid': int(p.get('ppid') or 0),
+                                        'lstart': ' '.join(str(p.get('lstart') or '').split()),
+                                        'argv': [str(a) for a in p.get('argv') or []],
+                                        'cwd': p.get('cwd'), 'open': [str(x) for x in p.get('open_files') or []]}
+            except (KeyError, TypeError, ValueError):
+                continue
+        return procs, True
+    env = dict(os.environ, TZ='UTC', LC_ALL='C')
+    try:
+        out = subprocess.run(['ps', '-A', '-ww', '-o', 'pid=,ppid=,lstart=,command='], capture_output=True,
+                             text=True, env=env, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}, False
+    procs = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 8 or not parts[0].isdigit():
+            continue
+        procs[int(parts[0])] = {'ppid': int(parts[1]) if parts[1].isdigit() else 0,
+                                'lstart': ' '.join(parts[2:7]), 'argv': parts[7:], 'cwd': None, 'open': None}
+    return procs, False
+
+def proc_cwd(pid, procs, test):
+    p = procs.get(pid) or {}
+    if test or p.get('cwd'):
+        return p.get('cwd')
+    link = '/proc/%d/cwd' % pid
     try:
         if os.path.islink(link):
             return os.readlink(link)
     except OSError:
         pass
-    # Portable fallback (macOS uses this): lsof.
     try:
-        out = subprocess.run(['lsof','-a','-p',str(pid),'-d','cwd','-Fn'],
+        out = subprocess.run(['lsof', '-a', '-p', str(pid), '-d', 'cwd', '-Fn'],
                              capture_output=True, text=True, timeout=5).stdout
         for ln in out.splitlines():
             if ln.startswith('n'):
                 return ln[1:]
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         pass
     return None
 
-def running():
-    """Return list of (tool, cwd, pid) for live interactive claude/codex leaves."""
+def claude_registry():
+    """Claude's live-session registry, or None when the directory is absent
+    (older Claude) — then nothing Claude is ever killable."""
     try:
-        out = subprocess.run(['ps','-axww','-o','pid=,command='],
-                             capture_output=True, text=True).stdout
-    except Exception:
-        return []
-    res = []
-    for line in out.splitlines():
-        s = line.strip()
-        if not s: continue
-        pid, _, cmd = s.partition(' ')
-        if not pid.isdigit(): continue
-        tool = None
-        # Real claude leaf: the toolbox injects --settings on the actual binary.
-        if '/claude-code/' in cmd and '/claude ' in cmd and '--settings' in cmd:
-            tool = 'claude'
-        # Interactive codex leaf (exclude non-interactive `codex exec` runs).
-        elif '/bin/codex' in cmd and ' exec' not in cmd:
-            tool = 'codex'
-        if not tool: continue
-        cwd = proc_cwd(pid)
-        if cwd:
-            res.append((tool, cwd, int(pid)))
+        names = os.listdir(CLAUDE_SESSIONS)
+    except OSError:
+        return None
+    regs = []
+    for n in names:
+        if not n.endswith('.json'):
+            continue
+        try:
+            with open(os.path.join(CLAUDE_SESSIONS, n)) as fh:
+                d = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict) and isinstance(d.get('pid'), int) and isinstance(d.get('sessionId'), str):
+            regs.append(d)
+    return regs
+
+def claude_exact(procs, regs):
+    """sid -> (pids, status) for registry entries whose pid is alive, started
+    exactly at procStart (not a reused pid), and is a claude binary."""
+    live = {}
+    for r in regs or ():
+        p = procs.get(r['pid'])
+        if not p or not p['argv'] or os.path.basename(p['argv'][0]) != 'claude':
+            continue
+        if ' '.join(str(r.get('procStart') or '').split()) != p['lstart']:
+            continue
+        pids, status = live.get(r['sessionId'], ([], ''))
+        st = r.get('status')
+        st = st if isinstance(st, str) and re.fullmatch(r'[a-z][a-z-]{0,19}', st) else ''
+        live[r['sessionId']] = (sorted(pids + [r['pid']]), status or st)
+    return live
+
+def codex_subcmd(argv):
+    skip = False
+    for tok in argv[1:]:
+        if skip:
+            skip = False
+            continue
+        if tok in CODEX_VALUE_FLAGS:
+            skip = True
+            continue
+        if tok.startswith('-'):
+            continue
+        return tok
+    return ''
+
+def _is_codex(p):
+    return bool(p and p['argv'] and os.path.basename(p['argv'][0]) == 'codex')
+
+def _codex_chain_subs(procs, pid):
+    """Subcommands named by this codex process and its codex ancestors (the
+    `exec` shim names `exec`; the real binary under it may not)."""
+    subs, q, hops = [], procs.get(pid), 0
+    while _is_codex(q) and hops < 8:
+        subs.append(codex_subcmd(q['argv']))
+        q = procs.get(q['ppid'])
+        hops += 1
+    return subs
+
+def codex_tuis(procs):
+    """Interactive codex TUI processes (for the display-only 'maybe' hint)."""
+    out = []
+    for pid, p in procs.items():
+        if not _is_codex(p):
+            continue
+        if all((sub in CODEX_TUI_SUBS or sub not in CODEX_SUBS) and not sub.startswith('__')
+               for sub in _codex_chain_subs(procs, pid)):
+            out.append(pid)
+    return out
+
+def codex_writers(procs):
+    """Codex processes that may hold a thread's writer lock: anything but the
+    multi-thread servers and internal helpers."""
+    return [pid for pid, p in procs.items() if _is_codex(p) and not any(
+        sub in CODEX_DAEMONS or sub.startswith('__') for sub in _codex_chain_subs(procs, pid))]
+
+def codex_holders(procs, test, tuis, rollout_of):
+    """tid -> [pids] from the thread-writer lock (or rollout file) a codex
+    process holds open. rollout_of: realpath(rollout) -> tid."""
+    held = {}
+    tui = set(tuis)
+    if test:
+        for pid in tuis:
+            for f in procs[pid].get('open') or []:
+                d, b = os.path.split(f)
+                if os.path.realpath(d) == os.path.realpath(CODEX_LOCKS) and b.endswith('.lock'):
+                    held.setdefault(b[:-5], []).append(pid)
+                else:
+                    tid = rollout_of.get(os.path.realpath(f))
+                    if tid:
+                        held.setdefault(tid, []).append(pid)
+        return held
+    if not tuis:
+        return held
+    # Only the codex processes' own open files (-a -p): ~0.07 s, versus ~0.3 s
+    # for asking lsof who holds the lock files (it then scans every process).
+    try:
+        out = subprocess.run(['lsof', '-a', '-p', ','.join(str(p) for p in sorted(tui)),
+                              '-b', '-w', '-n', '-P', '-Fpn'],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return held
+    locks = os.path.realpath(CODEX_LOCKS)
+    pid = None
+    for ln in out.splitlines():
+        if ln.startswith('p') and ln[1:].isdigit():
+            pid = int(ln[1:])
+        elif ln.startswith('n') and pid in tui:
+            f = ln[1:]
+            d, b = os.path.split(f)
+            if b.endswith('.lock') and not b.startswith('.') and os.path.realpath(d) == locks:
+                held.setdefault(b[:-5], []).append(pid)
+            elif f.endswith('.jsonl'):
+                tid = rollout_of.get(os.path.realpath(f))
+                if tid:
+                    held.setdefault(tid, []).append(pid)
+    return held
+
+def codex_exact(procs, test, writers, codex_ids, rollout_of):
+    """tid -> pids PROVEN to write that thread: the holder of its
+    thread-writer lock (or rollout file). argv is never proof: ps flattens it,
+    and `codex <uuid>` is a new session whose prompt happens to be an id."""
+    return {tid: sorted(set(p)) for tid, p in codex_holders(procs, test, writers, rollout_of).items()
+            if tid in codex_ids}
+
+def _chain_up(procs, pid):
+    """pid plus its codex ancestors (shim -> launcher -> real binary)."""
+    out, q, hops = [], procs.get(pid), 0
+    cur = pid
+    while _is_codex(q) and hops < 8:
+        out.append(cur)
+        cur = q['ppid']
+        q = procs.get(cur)
+        hops += 1
+    return out
+
+def assign_live(sessions):
+    procs, test = proc_table()
+    by_id = {}
+    for s in sessions:
+        if s['kind'] != 'child':
+            by_id[(s['tool'], s['id'])] = s
+    regs = claude_registry()
+    if regs is not None:
+        for sid, (pids, status) in claude_exact(procs, regs).items():
+            s = by_id.get(('claude', sid))
+            if s:
+                s['live'], s['pids'], s['status'] = 'exact', pids, status
+    else:
+        # No registry: a claude process in a folder is only a display hint.
+        cwds = {}
+        for pid, p in procs.items():
+            if p['argv'] and os.path.basename(p['argv'][0]) == 'claude':
+                c = proc_cwd(pid, procs, test)
+                if c:
+                    cwds.setdefault(c, []).append(pid)
+        _mark_maybe(sessions, 'claude', cwds)
+    tuis = codex_tuis(procs)
+    writers = codex_writers(procs)
+    if writers:
+        codex = [s for s in sessions if s['tool'] == 'codex']
+        ids = {s['id'] for s in codex}
+        rollout_of = {os.path.realpath(s['path']): s['id'] for s in codex if s['path']}
+        exact = codex_exact(procs, test, writers, ids, rollout_of)
+        covered = set()
+        for tid, pids in exact.items():
+            s = by_id.get(('codex', tid))
+            if s:
+                s['live'], s['pids'] = 'exact', pids
+            for pid in pids:
+                covered.update(_chain_up(procs, pid))
+        cwds = {}
+        for pid in tuis:
+            if pid in covered:
+                continue
+            c = proc_cwd(pid, procs, test)
+            if c:
+                cwds.setdefault(c, []).append(pid)
+        _mark_maybe(sessions, 'codex', cwds)
+
+def _mark_maybe(sessions, tool, cwds):
+    """The newest root in each folder with an unmapped live process gets a
+    'maybe' mark — a display hint that never authorizes a kill."""
+    for c, pids in cwds.items():
+        cand = [s for s in sessions if s['tool'] == tool and s['kind'] == 'root' and s['cwd'] == c
+                and not s['live']]
+        if cand:
+            s = max(cand, key=lambda x: x['updated'])
+            s['live'], s['pids'] = 'maybe', sorted(pids)
+
+def build_index(live=True):
+    cache = Cache()
+    warnings = []
+    sessions = claude_sessions(cache) + codex_sessions(cache, warnings)
+    cache.save()
+    parents = {}
+    for s in sessions:
+        if s['kind'] != 'child':
+            parents[(s['tool'], s['id'])] = s
+    for s in sessions:
+        if s['kind'] == 'child':
+            p = parents.get((s['tool'], s['parent']))
+            if p:
+                p['children'] += 1
+                at = s['agent_type'] or 'subagent'
+                p['child_types'][at] = p['child_types'].get(at, 0) + 1
+    if live:
+        assign_live(sessions)
+    sessions.sort(key=lambda s: -s['updated'])
+    return {'sessions': sessions, 'warnings': warnings}
+
+def kill_check(tool, sid):
+    """Fresh, exact re-validation right before any signal. ok only when baton can
+    PROVE which process holds this session; 'maybe' is never ok."""
+    idx = build_index(live=False)
+    target = None
+    for s in idx['sessions']:
+        if s['tool'] == tool and s['id'] == sid and s['kind'] != 'child':
+            target = s
+            break
+    res = {'ok': False, 'pids': [], 'reason': 'not-live', 'title': target['title'] if target else '',
+           'status': '', 'started': '', 'ident': {}}
+    if not target:
+        res['reason'] = 'unknown-session'
+        return res
+    procs, test = proc_table()
+    if tool == 'claude':
+        regs = claude_registry()
+        if regs is None:
+            res['reason'] = 'no-registry'
+            return res
+        mine = [r for r in regs if r.get('sessionId') == sid]
+        hit = claude_exact(procs, mine).get(sid)
+        if hit:
+            # Identity = the start time Claude itself recorded for the pid.
+            ident = {r['pid']: ' '.join(str(r.get('procStart') or '').split()) for r in mine
+                     if r['pid'] in hit[0]}
+            res.update(ok=True, pids=hit[0], status=hit[1], reason='exact',
+                       started=procs[hit[0][0]]['lstart'], ident=ident)
+        return res
+    tuis = codex_tuis(procs)
+    codex = [s for s in idx['sessions'] if s['tool'] == 'codex']
+    rollout_of = {os.path.realpath(s['path']): s['id'] for s in codex if s['path']}
+    exact = codex_exact(procs, test, codex_writers(procs), {s['id'] for s in codex}, rollout_of)
+    if exact.get(sid):
+        pids = exact[sid]
+        res.update(ok=True, pids=pids, reason='exact', started=procs[pids[0]]['lstart'],
+                   ident={pid: procs[pid]['lstart'] for pid in pids})
+        return res
+    covered = set()
+    for pids in exact.values():
+        for pid in pids:
+            covered.update(_chain_up(procs, pid))
+    here = [pid for pid in tuis if pid not in covered and proc_cwd(pid, procs, test) == target['cwd']]
+    if here:
+        res.update(reason='maybe', pids=sorted(here), started=procs[sorted(here)[0]]['lstart'])
     return res
 
-# ---------- session discovery ----------
-def claude_files():
-    out = []
-    for f in glob.glob(os.path.join(HOME,'.claude','projects','*','*.jsonl')):
-        try: mt = os.path.getmtime(f)
-        except OSError: continue
-        out.append(('claude', f, mt))
-    return out
+class InspectError(Exception):
+    """ps could not tell whether a pid is alive: never read that as "gone"."""
 
-def codex_files():
-    out = []
-    for f in glob.glob(os.path.join(HOME,'.codex','sessions','*','*','*','rollout-*.jsonl')):
-        try: mt = os.path.getmtime(f)
-        except OSError: continue
-        out.append(('codex', f, mt))
-    return out
-
-def claude_meta(f):
-    """(session_id, launch_cwd, first_prompt). id == filename stem."""
-    sid = os.path.basename(f)[:-6]
-    cwd = prompt = None
+def _lstart(pid):
+    """Start time (UTC) of a running pid; None if it's definitely gone (or a
+    zombie). Raises InspectError when ps itself fails."""
     try:
-        with open(f) as fh:
-            for i, ln in enumerate(fh):
-                if i > 400: break
-                try: d = json.loads(ln)
-                except Exception: continue
-                if not isinstance(d, dict): continue
-                if cwd is None and isinstance(d.get('cwd'), str):
-                    cwd = d['cwd']
-                if prompt is None and d.get('type') == 'user':
-                    msg = d.get('message', {})
-                    c = msg.get('content') if isinstance(msg, dict) else None
-                    text = None
-                    if isinstance(c, str): text = c
-                    elif isinstance(c, list):
-                        for p in c:
-                            if isinstance(p, dict) and p.get('type') == 'text':
-                                text = p.get('text'); break
-                    prompt = first_real_text(text) or prompt
-                if cwd and prompt: break
-    except OSError:
-        pass
-    return sid, cwd, prompt
+        r = subprocess.run(['ps', '-o', 'stat=,lstart=', '-p', str(pid)], capture_output=True, text=True,
+                           env=dict(os.environ, TZ='UTC', LC_ALL='C'), timeout=5)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise InspectError(str(e))
+    out = r.stdout.split()
+    if not out:
+        if r.returncode == 1:
+            return None                      # no such process
+        raise InspectError('ps exited %d' % r.returncode)
+    if out[0].startswith('Z'):
+        return None
+    if len(out) < 6:
+        raise InspectError('unexpected ps output')
+    return ' '.join(out[1:6])
 
-def codex_meta(f):
-    """(session_id, launch_cwd, first_prompt) from the rollout file."""
-    sid = cwd = prompt = None
+def kill_session(tool, sid, expect):
+    """Validate AND signal in one step. The proof (kill_check) yields each
+    pid's identity: its ORIGINAL start time (for Claude, the procStart Claude
+    itself wrote). Every pid must still have that identity right before it is
+    signalled, so a recycled pid is never signalled on the strength of an old
+    proof. On Linux every pid is first pinned with a pidfd and signalled
+    through it, which is exact. Elsewhere (macOS) the residual risk is the
+    kill(2) race every POSIX tool has: the original exiting AND its pid being
+    reused in the microseconds between the last check and the signal. A ps
+    failure is never read as "gone". Then wait until every process is gone.
+    -> {'result': ended | changed | still-running | unknown | refused, 'pids'}"""
+    import errno, signal
+    if os.environ.get('BATON_TEST_PROCS'):
+        return {'result': 'refused', 'pids': [], 'detail': 'test mode never signals'}
+    res = kill_check(tool, sid)
+    pids, ident = res['pids'], res.get('ident') or {}
+    if not res['ok'] or ','.join(str(p) for p in pids) != expect or set(ident) != set(pids):
+        return {'result': 'changed', 'pids': pids}
+    fds = {}
     try:
-        with open(f) as fh:
-            for i, ln in enumerate(fh):
-                if i > 300: break
-                try: d = json.loads(ln)
-                except Exception: continue
-                if not isinstance(d, dict): continue
-                if d.get('type') == 'session_meta':
-                    p = d.get('payload', {}) or {}
-                    sid = sid or p.get('id')
-                    cwd = cwd or p.get('cwd')
-                if prompt is None:
-                    pl = d.get('payload', d)
-                    if isinstance(pl, dict) and (pl.get('type') in ('user_message','message') or pl.get('role') == 'user'):
-                        c = pl.get('content') or pl.get('text') or pl.get('message')
-                        text = None
-                        if isinstance(c, str): text = c
-                        elif isinstance(c, list):
-                            for q in c:
-                                if isinstance(q, dict) and q.get('text'):
-                                    text = q['text']; break
-                        prompt = first_real_text(text) or prompt
-                if sid and cwd and prompt: break
-    except OSError:
-        pass
-    return sid, cwd, prompt
+        try:
+            if any(_lstart(pid) != ident[pid] for pid in pids):
+                return {'result': 'changed', 'pids': pids}     # nothing signalled yet
+            if hasattr(os, 'pidfd_open') and hasattr(signal, 'pidfd_send_signal'):
+                for pid in pids:                              # pin them ALL before signalling any
+                    try:
+                        fds[pid] = os.pidfd_open(pid)
+                    except ProcessLookupError:
+                        pass                                  # already gone
+                    except OSError as e:
+                        if e.errno != errno.ENOSYS:           # only a pre-5.3 kernel may fall back
+                            return {'result': 'still-running', 'pids': pids}
+                        fds = {}
+                        break
+            for pid in pids:
+                if _lstart(pid) != ident[pid]:
+                    continue                                  # exited since the preflight
+                if pid in fds:
+                    signal.pidfd_send_signal(fds[pid], signal.SIGTERM)
+                else:
+                    os.kill(pid, signal.SIGTERM)
+        except InspectError:
+            return {'result': 'unknown', 'pids': pids}
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return {'result': 'still-running', 'pids': pids}
+    finally:
+        for fd in fds.values():
+            os.close(fd)
+    deadline = time.time() + 5
+    while True:
+        try:
+            alive = [pid for pid in pids if _lstart(pid) == ident[pid]]
+        except InspectError:
+            return {'result': 'unknown', 'pids': pids}
+        if not alive:
+            return {'result': 'ended', 'pids': pids}
+        if time.time() > deadline:
+            return {'result': 'still-running', 'pids': alive}
+        time.sleep(0.2)
 
-# ---------- preview ----------
-# Show a clean Q&A transcript: the user's real questions and the assistant's
-# actual answers — NOT thinking blocks, tool calls, tool results, or the
-# "let me check X / now let me Y" narration between tool calls. We do this by
-# keeping only text content, dropping tool_result-wrapper user turns, and
-# collapsing consecutive assistant chatter into the single latest answer per
-# turn (the substantive reply that precedes the next user question).
-def preview(path, tool):
+# ---------- UI state (written by the bash key dispatcher; values %-encoded) ----------
+def load_state():
+    raw = {'tool': 'both', 'all': '0', 'expanded': '', 'unfolded': ''}
+    p = os.environ.get('BATON_STATE', '')
+    if p:
+        try:
+            with open(p) as fh:
+                for line in fh:
+                    k, sep, v = line.rstrip('\n').partition('=')
+                    if sep and k in raw:
+                        raw[k] = v
+        except OSError:
+            pass
+    return {'tool': raw['tool'] if raw['tool'] in ('both', 'claude', 'codex') else 'both',
+            'query': '', 'all': raw['all'] == '1',
+            'expanded': {unquote(x) for x in raw['expanded'].split() if x},
+            'unfolded': {unquote(x) for x in raw['unfolded'].split() if x}}
+
+# ---------- rows ----------
+# TSV fields: 1 preview path · 2 resume tool · 3 resume id (empty = not
+# selectable) · 4 resume cwd · 5 folder (for +/=) · 6 unfold key "tool:id" ·
+# 7 row type (folder|session|child|status) · 8 live (exact|maybe|'') ·
+# 9 preview card (%-encoded JSON) · 10 display text.
+C_DIR = '\033[1;36m'; C_DOT = '\033[1;32m'; C_BUSY = '\033[1;33m'; C_MAYBE = '\033[2;37m'
+C_TOOL = '\033[35m'; C_AGE = '\033[90m'; C_TXT = '\033[37m'; C_HINT = '\033[90m'
+C_SNIP = '\033[2;37m'; C_HDR = '\033[1;33m'; C_TAG = '\033[2;33m'; C_OFF = '\033[0m'
+
+def emit(*fields):
+    print('\t'.join(tsv(f) for f in fields))
+
+def card_of(s, parent=None):
+    c = {'t': s['title'], 'tool': s['tool'], 'k': s['kind'], 'r': s['reason'], 'l': s['live'],
+         'p': s['pids'], 'st': s['status'], 'b': s['branch'], 'z': s['size'], 'cwd': clean_line(s['cwd']),
+         'cr': s['created'], 'up': s['updated'], 'fp': s['first_prompt'][:240], 'lp': s['last_prompt'][:240],
+         'n': s['children'], 'ct': s['child_types'], 'id': s['id'], 'a': s['agent_type']}
+    if parent is not None:
+        c['pt'] = parent['title'] if parent else ''
+        c['pid'] = parent['id'] if parent else ''
+    return quote(json.dumps(c, separators=(',', ':'), ensure_ascii=False), safe='')
+
+def dot_of(s):
+    if s['live'] == 'exact':
+        return (C_BUSY if s['status'] in ('busy', 'waiting') else C_DOT) + '●' + C_OFF
+    if s['live'] == 'maybe':
+        return C_MAYBE + '◌' + C_OFF
+    return ' '
+
+def tag_of(s):
+    if s['kind'] == 'root':
+        return ''
+    t = 'cont.' if s['kind'] == 'superseded' else (s['reason'] or s['kind'])
+    return C_TAG + '[' + t + '] ' + C_OFF
+
+def disp_session(s, snippet=None):
+    n = s['children']
+    badge = (C_HINT + ('⤷%-3d' % n) + C_OFF) if n else '    '
+    line = '  %s %s%-6s%s %s%4s%s %s %s%s%s%s' % (
+        dot_of(s), C_TOOL, s['tool'], C_OFF, C_AGE, ago(s['updated']), C_OFF, badge,
+        tag_of(s), C_TXT, s['title'][:200], C_OFF)
+    if snippet:
+        line += '   %s%s%s' % (C_SNIP, clean_line(snippet)[:60], C_OFF)
+    return line
+
+def disp_child(c):
+    return '      %s⤷%s %s%4s%s %s%s%s' % (C_HINT, C_OFF, C_AGE, ago(c['updated']), C_OFF,
+                                         C_TXT, c['title'][:200], C_OFF)
+
+def ukey(s):
+    return '%s:%s' % (s['tool'], s['id'])
+
+def emit_session(s, snippet=None):
+    emit(s['path'], s['tool'], s['id'], s['cwd'], s['cwd'], ukey(s) if s['children'] else '',
+         'session', s['live'], card_of(s), disp_session(s, snippet))
+
+def emit_child(c, parent):
+    # Enter on a child resumes its PARENT (a Claude subagent is not resumable
+    # on its own); disabled when the parent isn't a visible, resumable session.
+    ok = parent is not None and parent['kind'] in ('root', 'automated', 'superseded')
+    emit(c['path'], parent['tool'] if ok else '', parent['id'] if ok else '', parent['cwd'] if ok else '',
+         c['cwd'], ukey(parent) if parent else '', 'child', parent['live'] if ok else '',
+         card_of(c, parent if ok else False), disp_child(c))
+
+def emit_header(cwd, hint='', here=False, info=None):
+    label = C_DIR + clean_line(tilde(cwd)) + C_OFF
+    if here:
+        label += C_HINT + ' · here' + C_OFF
+    card = quote(json.dumps(dict(info or {}, f=clean_line(cwd)), separators=(',', ':'),
+                            ensure_ascii=False), safe='')
+    emit('', '', '', '', cwd, '', 'folder', '', card, label + hint)
+
+def emit_status(text):
+    emit('', '', '', '', '', '', 'status', '', '', C_HDR + text + C_OFF)
+
+def origin_folder(cwds):
+    o = (os.environ.get('BATON_ORIGIN') or '').rstrip('/')
+    if not o:
+        return None
+    best = None
+    for c in cwds:
+        if not c or (c == HOME and o != HOME):
+            continue
+        if o == c or o.startswith(c.rstrip('/') + '/'):
+            if best is None or len(c) > len(best):
+                best = c
+    return best
+
+def view_sets(st, idx):
+    """-> (tops, kids, parents) for the current tool filter / all-mode."""
+    tool, allm = st['tool'], st['all']
+    shown = SHOWN_ALL if allm else SHOWN
+    def ok(s): return tool == 'both' or s['tool'] == tool
+    ss = idx['sessions']
+    parents = {(s['tool'], s['id']): s for s in ss if s['kind'] != 'child'}
+    tops = [s for s in ss if s['kind'] in shown and ok(s)]
+    kids = {}
+    for s in ss:
+        if s['kind'] != 'child' or not ok(s):
+            continue
+        k = (s['tool'], s['parent'])
+        if k in parents:
+            kids.setdefault(k, []).append(s)
+        elif allm:
+            tops.append(s)                  # orphan subagent: only in all-mode
+    return tops, kids, parents
+
+def group_sort(rows, origin):
+    gmax, glive = {}, {}
+    for s in rows:
+        gmax[s['cwd']] = max(gmax.get(s['cwd'], 0), s['updated'])
+        glive[s['cwd']] = glive.get(s['cwd'], False) or bool(s['live'])
+    rows.sort(key=lambda s: (0 if glive[s['cwd']] else 1, 0 if s['cwd'] == origin else 1,
+                             -gmax[s['cwd']], s['cwd'], 0 if s['live'] else 1, -s['updated']))
+    return rows
+
+def hidden_note(st, idx, tops, kids):
+    tool = st['tool']
+    def ok(s): return tool == 'both' or s['tool'] == tool
+    n_auto = sum(1 for s in idx['sessions'] if s['kind'] in ('automated', 'superseded') and ok(s))
+    n_sub = sum(len(kids.get((s['tool'], s['id']), ())) for s in tops)
+    if st['all']:
+        note = 'showing %s automated · %s subagents folded (→ unfold)' % (format(n_auto, ','), format(n_sub, ','))
+    else:
+        note = 'hidden: %s automated · %s subagents — ctrl-a automated · → subagents' % (
+            format(n_auto, ','), format(n_sub, ','))
+    for w in idx['warnings']:
+        note += ' · ' + w
+    return note
+
+def list_view(height, st, idx):
+    """Default view: pin every live session, reserve a few rows for the launch
+    folder, then fill the terminal with the globally most-recent sessions,
+    grouped by folder (no empty folders). An expanded folder (+) shows all its
+    sessions; an unfolded parent (→) shows its subagents. Both are exempt from
+    the fill budget."""
+    tops, kids, parents = view_sets(st, idx)
+    origin = origin_folder({s['cwd'] for s in tops})
+    rows = group_sort(list(tops), origin)
+    gcount = {}
+    for s in rows:
+        gcount[s['cwd']] = gcount.get(s['cwd'], 0) + 1
+    CHROME = 6                               # 2 header lines + prompt/info + status + slack
+    budget = (height - CHROME) if height and height > 0 else 60
+    budget = max(budget, 8)
+    show, folders, used = set(), set(), 0
+    def key(s): return (s['tool'], s['id'])
+    def take(s):
+        nonlocal used
+        show.add(key(s))
+        if s['cwd'] not in folders:
+            folders.add(s['cwd'])
+            used += 1
+        used += 1
+    for s in rows:                           # 1) pinned: live + expanded folders
+        if s['live'] or s['cwd'] in st['expanded']:
+            take(s)
+    if origin:                               # 2) the launch folder's newest few
+        for s in [r for r in rows if r['cwd'] == origin and key(r) not in show][:5]:
+            take(s)
+    for s in sorted(rows, key=lambda r: -r['updated']):    # 3) fill by recency
+        if used >= budget:
+            break
+        if key(s) in show:
+            continue
+        if used + 1 + (0 if s['cwd'] in folders else 1) > budget:
+            continue                         # too expensive now; a cheaper one may fit
+        take(s)
+    emit_status(hidden_note(st, idx, tops, kids))
+    shown_per = {}
+    for s in rows:
+        if key(s) in show:
+            shown_per[s['cwd']] = shown_per.get(s['cwd'], 0) + 1
+    prev = None
+    for s in rows:
+        if key(s) not in show:
+            continue
+        if s['cwd'] != prev:
+            prev = s['cwd']
+            hidden = gcount[s['cwd']] - shown_per.get(s['cwd'], 0)
+            hint = ''
+            if s['cwd'] not in st['expanded'] and hidden > 0:
+                hint = ' %s(+%d older · press +)%s' % (C_HINT, hidden, C_OFF)
+            emit_header(s['cwd'], hint, s['cwd'] == origin,
+                        {'n': gcount[s['cwd']], 'h': 0 if s['cwd'] in st['expanded'] else hidden,
+                         'x': s['cwd'] in st['expanded'],
+                         'lv': sum(1 for r in rows if r['cwd'] == s['cwd'] and r['live'])})
+        if s['kind'] == 'child':             # orphan (all-mode)
+            emit_child(s, None)
+            continue
+        emit_session(s)
+        if ukey(s) in st['unfolded']:
+            for c in sorted(kids.get(key(s), ()), key=lambda c: -c['updated']):
+                emit_child(c, s)
+
+# ---------- content search ----------
+def _msg_text_of(d, tool):
+    """Conversation text of a JSONL record ('' if not a user/assistant message).
+    Mirrors the preview's filtering so search and preview agree."""
+    if tool == 'claude':
+        if d.get('type') not in ('user', 'assistant'):
+            return ''
+        msg = d.get('message', {})
+        c = msg.get('content') if isinstance(msg, dict) else None
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            if any(isinstance(p, dict) and p.get('type') == 'tool_result' for p in c):
+                return ''
+            return ' '.join(p.get('text', '') for p in c if isinstance(p, dict) and p.get('type') == 'text')
+        return ''
+    role, t = codex_msg(d)
+    if role == 'user' and (t or '').strip().startswith(CODEX_INJECTED):
+        return ''
+    return t or ''
+
+def content_hits(term, meta):
+    """({path: snippet}, truncated, have_rg, skipped_huge). rg runs over the
+    EXPLICIT list of candidate files (never whole directories), chunked so the
+    argument list stays well under ARG_MAX; we json-parse only matched lines."""
+    from shutil import which
+    rg = which('rg')
+    if not rg or not meta:
+        return {}, False, bool(rg), 0
+    SEP = '\x1f'
+    MAX_RECORDS = 50000
+    HUGE_REC = 1024 * 1024
+    paths = sorted(meta, key=lambda p: -meta[p]['updated'])
+    chunks, cur, size = [], [], 0
+    for p in paths:
+        n = len(os.fsencode(p)) + 1
+        if cur and size + n > 200000:
+            chunks.append(cur)
+            cur, size = [], 0
+        cur.append(p)
+        size += n
+    if cur:
+        chunks.append(cur)
+    needle = term.lower()
+    hits, truncated, skipped, seen = {}, False, 0, 0
+    for chunk in chunks:
+        try:
+            proc = subprocess.Popen(
+                [rg, '--fixed-strings', '--ignore-case', '--no-messages', '--no-config', '--color=never',
+                 '--no-heading', '--with-filename', '--no-line-number', '--field-match-separator', SEP,
+                 '--', term] + chunk,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors='replace')
+        except OSError:
+            return hits, truncated, True, skipped
+        try:
+            for line in proc.stdout:
+                seen += 1
+                if seen > MAX_RECORDS:
+                    truncated = True
+                    break
+                path, _, rec = line.partition(SEP)
+                if path in hits or path not in meta:
+                    continue
+                if len(rec) > HUGE_REC:
+                    skipped += 1
+                    continue
+                try:
+                    d = json.loads(rec)
+                except ValueError:
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                txt = _msg_text_of(d, meta[path]['tool'])
+                i = txt.lower().find(needle)
+                if i >= 0:
+                    s = max(0, i - 30)
+                    hits[path] = clean_line(txt[s:s + 120])
+        finally:
+            try:
+                proc.stdout.close()
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if truncated:
+            break
+    return hits, truncated, True, skipped
+
+def filter_view(st, idx):
+    """Unified search: name tier (title / prompts / branch / folder / id) plus a
+    content tier (conversation text), over the sessions currently shown
+    (roots; + automated in all-mode). Subagents are never searched. Matches are
+    grouped under their folders, live-first."""
+    term = st['query']
+    needle = term.lower()
+    tops, kids, parents = view_sets(st, idx)
+    tops = [s for s in tops if s['kind'] != 'child']
+    origin = origin_folder({s['cwd'] for s in tops})
+    def name_match(s):
+        return any(needle in (v or '').lower() for v in
+                   (s['title'], s['first_prompt'], s['last_prompt'], s['branch'], s['cwd'], s['id'], s['tool']))
+    content, truncated, have_rg, skipped = {}, False, True, 0
+    if len(term) >= 3:
+        content, truncated, have_rg, skipped = content_hits(term, {s['path']: s for s in tops if s['path']})
+    matched = []
+    for s in group_sort(list(tops), origin):
+        snip = content.get(s['path'])
+        if name_match(s) or snip is not None:
+            matched.append((s, snip))
+    n = len(matched)
+    note = '%d match%s for "%s"' % (n, '' if n == 1 else 'es', clean_line(term))
+    if st['all']:
+        note += ' (incl. automated)'
+    if truncated:
+        note += ' (content truncated — refine query)'
+    if skipped:
+        note += ' (skipped %d large record%s)' % (skipped, '' if skipped == 1 else 's')
+    if not have_rg:
+        note += ' · names only (install ripgrep for content search)'
+    emit_status(note)
+    prev = None
+    for s, snip in matched:
+        if s['cwd'] != prev:
+            prev = s['cwd']
+            emit_header(s['cwd'], '', s['cwd'] == origin)
+        emit_session(s, snip)
+
+def _stale(query):
+    """Debounce: record this render's query, wait 150 ms, and report whether a
+    newer keystroke's render has replaced it. fzf also kills the superseded
+    reload; this keeps a slow search from running when that kill is late."""
+    base = os.environ.get('BATON_STATE', '')
+    if not base:
+        return False
+    qf = base + '.q'
+    token = '%d:%s' % (os.getpid(), query)
     try:
-        lines = open(path).read().splitlines()
+        tmp = '%s.%d.tmp' % (base, os.getpid())
+        with open(tmp, 'w') as fh:
+            fh.write(token)
+        os.replace(tmp, qf)
+        time.sleep(0.15)
+        with open(qf) as fh:
+            return fh.read() != token
     except OSError:
-        print("(cannot read session file)"); return
+        return False
 
-    def clean(s):
-        s = ' '.join((s or '').split())
-        if not s or s.startswith('<'): return None
-        if s[:30].lower().startswith('caveat'): return None
-        return s
+def render(height, query, initial):
+    st = load_state()
+    st['query'] = query
+    if query and len(query) >= 3 and _stale(query):
+        return 0
+    idx = build_index()
+    if initial and not idx['sessions']:
+        return 3
+    if st['query']:
+        filter_view(st, idx)
+    else:
+        list_view(height, st, idx)
+    return 0
 
-    seq = []   # list of [role, text]; assistant runs collapse to the latest
+# ---------- preview: description card + readable transcript ----------
+P_YOU = '\033[1;36m'; P_AI = '\033[1;35m'; P_CODE = '\033[2;37m'; P_OFF = '\033[0m'
+P_TITLE = '\033[1;37m'; P_DIM = '\033[2;37m'; P_LBL = '\033[1;34m'
+PER_MSG_CHARS = 1200
+MAX_TURNS = 8
+
+def print_card(c, width):
+    """Exactly CARD_H lines, none wider than the pane (so ~CARD_H stays aligned)."""
+    W = max(20, width - 1)
+    if not c:
+        for _ in range(CARD_H):
+            print()
+        return
+    tool = c.get('tool', '')
+    kind = c.get('k', '')
+    lines = [P_TITLE + fit(c.get('t') or '(session)', W) + P_OFF]
+    if c.get('l') == 'exact':
+        live = '● live%s pid %s' % ((' (%s)' % c['st']) if c.get('st') else '',
+                                   ','.join(str(p) for p in c.get('p') or []))
+    elif c.get('l') == 'maybe':
+        live = '◌ a %s process is running in this folder' % tool
+    else:
+        live = 'not running'
+    bits = [tool]
+    if kind == 'child':
+        bits.append('subagent' + ((' (%s)' % c['a']) if c.get('a') else ''))
+    elif kind != 'root':
+        bits.append('%s: %s' % (kind, c.get('r') or ''))
+    bits.append(live)
+    if c.get('b'):
+        bits.append('branch ' + c['b'])
+    if c.get('z'):
+        bits.append(human_size(c['z']))
+    lines.append(P_DIM + fit(' · '.join(bits), W) + P_OFF)
+    when = [tilde(c.get('cwd') or '')]
+    if c.get('cr'):
+        when.append('started %s ago' % ago(c['cr']))
+    if c.get('up'):
+        when.append('updated %s ago' % ago(c['up']))
+    lines.append(P_DIM + fit(' · '.join(w for w in when if w), W) + P_OFF)
+    def labeled(label, text):
+        return P_LBL + label + P_OFF + fit(text or '—', W - len(label))
+    fp, lp = c.get('fp') or '', c.get('lp') or ''
+    lines.append(labeled('First ask: ', fp))
+    lines.append(labeled('Last ask:  ', lp if lp and lp != fp else '—'))
+    if kind == 'child':
+        if c.get('pt'):
+            lines.append(labeled('Enter resumes parent: ', c['pt']))
+        else:
+            lines.append(P_DIM + fit('parent not resumable here — Enter does nothing', W) + P_OFF)
+    else:
+        ct = c.get('ct') or {}
+        sub = ''
+        if c.get('n'):
+            parts = ['%s ×%d' % (k, v) for k, v in sorted(ct.items(), key=lambda kv: -kv[1])]
+            sub = 'Subagents: %d (%s) → unfold' % (c['n'], ', '.join(parts))
+        idtxt = 'id ' + (c.get('id') or '')[:13]
+        lines.append(P_DIM + fit((sub + '   ' + idtxt) if sub else idtxt, W) + P_OFF)
+    lines.append(P_DIM + '─' * W + P_OFF)
+    for ln in lines[:CARD_H]:
+        print(ln)
+
+def _clean_prose_line(s):
+    """Conservative de-markdown of a PROSE line (never a code line): headers,
+    -/+ bullets, **bold**. Single-* and __dunders__ are left alone."""
+    s = s.rstrip()
+    s = re.sub(r'^\s{0,3}#{1,6}\s+', '', s)
+    s = re.sub(r'^(\s*)[-+]\s+', r'\1• ', s)
+    s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)
+    return s
+
+def _format_message(text):
+    text = clean_text(text).strip()
+    if not text:
+        return []
+    if len(text) > PER_MSG_CHARS:
+        cut = text.rfind(' ', 0, PER_MSG_CHARS)
+        if cut < PER_MSG_CHARS // 2:
+            cut = PER_MSG_CHARS
+        text = text[:cut].rstrip() + ' …'
+    out, in_code = [], False
+    for raw in text.split('\n'):
+        if raw.lstrip().startswith('```'):
+            in_code = not in_code
+            continue
+        out.append(('%s    %s%s' % (P_CODE, raw, P_OFF)) if in_code else _clean_prose_line(raw))
+    tidy, blanks = [], 0
+    for ln in out:
+        if ln.strip() == '':
+            blanks += 1
+            if blanks > 1:
+                continue
+        else:
+            blanks = 0
+        tidy.append(ln)
+    return tidy
+
+def _read_tail(path, nbytes):
+    try:
+        sz = os.path.getsize(path)
+        with open(path, 'rb') as fh:
+            if sz > nbytes:
+                fh.seek(sz - nbytes)
+            data = fh.read()
+    except OSError:
+        return None, False
+    lines = data.split(b'\n')
+    if sz > nbytes and lines:
+        lines = lines[1:]                  # partial first line
+    return lines, sz > nbytes
+
+def _conversation(lines, tool):
+    """[[role, text], ...] of real questions and final answers: no thinking,
+    tool calls, tool results, or the narration between tool calls (a run of
+    assistant texts collapses to the latest)."""
+    seq = []
     def add(role, text):
-        text = clean(text)
-        if not text: return
+        t = (text or '').strip()
+        if not t or t.startswith('<') or t.startswith('[Request interrupted'):
+            return
         if role == 'assistant' and seq and seq[-1][0] == 'assistant':
-            seq[-1][1] = text          # collapse narration -> keep latest
+            seq[-1][1] = text
         else:
             seq.append([role, text])
-
     for ln in lines:
-        try: d = json.loads(ln)
-        except Exception: continue
-        if not isinstance(d, dict): continue
+        if b'"tool_result"' in ln and tool == 'claude':
+            continue                        # fed-back tool output (the bulk of a transcript)
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue
+        if not isinstance(d, dict):
+            continue
         if tool == 'claude':
             t = d.get('type')
-            if t not in ('user','assistant'): continue
+            if t not in ('user', 'assistant') or d.get('isMeta') or d.get('isCompactSummary'):
+                continue
             msg = d.get('message', {})
             c = msg.get('content') if isinstance(msg, dict) else None
-            if t == 'user':
-                if isinstance(c, list) and any(isinstance(p, dict) and p.get('type') == 'tool_result' for p in c):
-                    continue   # tool output fed back in, not a real question
-                if isinstance(c, str): add('user', c)
-                elif isinstance(c, list):
-                    parts = [p.get('text') for p in c
-                             if isinstance(p, dict) and p.get('type') == 'text' and p.get('text')]
-                    if parts: add('user', ' '.join(parts))
-            else:  # assistant: text blocks only (skips thinking + tool_use)
-                if isinstance(c, list):
-                    parts = [p.get('text') for p in c
-                             if isinstance(p, dict) and p.get('type') == 'text' and p.get('text')]
-                    if parts: add('assistant', ' '.join(parts))
-        else:  # codex
-            pl = d.get('payload', d)
-            if not isinstance(pl, dict): continue
-            ty = pl.get('type'); rl = pl.get('role')
-            if not (rl in ('user','assistant') or ty in ('user_message','agent_message','message')):
-                continue
-            role = rl or ('assistant' if 'agent' in (ty or '') else 'user')
-            c = pl.get('content') or pl.get('text')
-            text = None
-            if isinstance(c, str): text = c
+            if t == 'user' and isinstance(c, str):
+                add('user', c)
             elif isinstance(c, list):
-                parts = [q.get('text') for q in c if isinstance(q, dict) and q.get('text')]
-                text = ' '.join(parts)
-            add(role, text)
+                parts = [p.get('text') for p in c if isinstance(p, dict) and p.get('type') == 'text' and p.get('text')]
+                if parts:
+                    add(t, '\n'.join(parts))
+        else:
+            role, text = codex_msg(d)
+            if role == 'user' and (text or '').strip().startswith(CODEX_INJECTED):
+                continue
+            if role:
+                add(role, text)
+    return seq
 
-    for role, t in seq[-12:]:
-        tag = 'You ▸' if role == 'user' else '  ◂ '
-        print("%s %s" % (tag, t[:300]))
+def transcript(path, tool):
+    """Readable Q&A tail. Tool traffic can push your last question megabytes
+    back, so the window widens (2, 8, then 32 MB) until it holds your turns."""
+    seq = []
+    for nbytes in (2, 8, 32):
+        lines, more = _read_tail(path, nbytes * 1024 * 1024)
+        if lines is None:
+            print("(cannot read session file)")
+            return
+        seq = _conversation(lines, tool)
+        users = sum(1 for r, _ in seq if r == 'user')
+        # Stop at two questions; go past 8 MB only if there is none at all
+        # (bounds the I/O of a cursor move on huge single-turn sessions).
+        if not more or users >= 2 or (nbytes == 8 and users):
+            break
     if not seq:
         print("(no readable messages yet)")
+        return
+    ai_label = 'Codex:' if tool == 'codex' else 'Claude:'
+    first = True
+    for role, t in seq[-MAX_TURNS:]:
+        body = _format_message(t)
+        if not body:
+            continue
+        if not first:
+            print()
+        first = False
+        print(('%sYou:%s' % (P_YOU, P_OFF)) if role == 'user' else ('%s%s%s' % (P_AI, ai_label, P_OFF)))
+        for line in body:
+            print(line)
 
-# ---------- list ----------
-def build(show_all):
-    acts = running()
-    active_pairs = {}                       # (tool,cwd) -> [pids]
-    for tool, cwd, pid in acts:
-        active_pairs.setdefault((tool, cwd), []).append(pid)
+def print_folder(c, width):
+    W = max(20, width - 1)
+    print(P_TITLE + fit(tilde(c.get('f') or ''), W) + P_OFF)
+    if 'n' in c:
+        n, lv, h = c.get('n', 0), c.get('lv', 0), c.get('h', 0)
+        print(P_DIM + fit('%d session%s%s' % (n, '' if n == 1 else 's', (' · %d live' % lv) if lv else ''), W) + P_OFF)
+        print()
+        if c.get('x'):
+            print(fit('Showing every session here. + collapses the folder.', W))
+        elif h:
+            print(fit('%d older session%s hidden. + shows them all.' % (h, '' if h == 1 else 's'), W))
+        else:
+            print(fit('Every session here is shown.', W))
+    print()
+    print(P_DIM + fit('Pick a session below to resume it.', W) + P_OFF)
 
-    files = claude_files() + codex_files()
-    files.sort(key=lambda x: x[2], reverse=True)   # newest mtime first
+def preview_main(path, tool, card):
+    try:
+        width = int(os.environ.get('FZF_PREVIEW_COLUMNS') or 80)
+    except ValueError:
+        width = 80
+    c = {}
+    if card:
+        try:
+            c = json.loads(unquote(card))
+        except ValueError:
+            c = {}
+    if not isinstance(c, dict):
+        c = {}
+    if not path:
+        if c.get('f'):
+            print_folder(c, width)
+        return
+    print_card(c, width)
+    transcript(path, tool)
 
-    rows = []
-    used = {}                               # (tool,cwd) -> count marked active
-    parsed = 0
-    PARSE_CAP = 90
-    RECENT_INACTIVE = 10                     # default view: active + N most-recent closed
-    inactive_kept = 0
-    for tool, path, mt in files:            # files are newest-mtime first
-        if parsed >= PARSE_CAP: break
-        parsed += 1
-        if tool == 'claude': sid, cwd, prompt = claude_meta(path)
-        else:                sid, cwd, prompt = codex_meta(path)
-        if not sid or not cwd: continue
-        key = (tool, cwd)
-        is_active = 0
-        if key in active_pairs:
-            u = used.get(key, 0)
-            if u < len(active_pairs[key]):
-                used[key] = u + 1
-                is_active = 1
-        if not is_active and not show_all:
-            # Default view: keep only the N most-recent closed sessions. Because
-            # files are sorted newest-first, the first N inactive we see are them.
-            if inactive_kept >= RECENT_INACTIVE:
-                continue
-            inactive_kept += 1
-        pids = ','.join(str(p) for p in active_pairs.get(key, [])) if is_active else ''
-        rows.append({'path':path,'tool':tool,'id':sid,'cwd':cwd,
-                     'active':is_active,'pids':pids,'mtime':mt,'prompt':prompt or '(no prompt yet)'})
+# ---------- main ----------
+def main(argv):
+    mode = argv[1] if len(argv) > 1 else 'dump'
+    if mode == 'dump':
+        idx = build_index()
+        json.dump(idx, sys.stdout, ensure_ascii=False)
+        print()
+        return 0
+    if mode == 'stats':
+        idx = build_index(live=False)
+        out = {'claude': {k: 0 for k in KINDS}, 'codex': {k: 0 for k in KINDS}, 'warnings': idx['warnings']}
+        for s in idx['sessions']:
+            out[s['tool']][s['kind']] += 1
+        json.dump(out, sys.stdout)
+        print()
+        return 0
+    if mode == 'render':
+        try:
+            h = int(argv[2]) if len(argv) > 2 else 0
+        except ValueError:
+            h = 0
+        return render(h, argv[3] if len(argv) > 3 else '', len(argv) > 4 and argv[4] == 'initial')
+    if mode == 'preview':
+        preview_main(argv[2] if len(argv) > 2 else '', argv[3] if len(argv) > 3 else 'claude',
+                     argv[4] if len(argv) > 4 else '')
+        return 0
+    if mode == 'kill-check':
+        tool = argv[2] if len(argv) > 2 else ''
+        sid = argv[3] if len(argv) > 3 else ''
+        res = kill_check(tool, sid) if tool in ('claude', 'codex') and sid else \
+            {'ok': False, 'pids': [], 'reason': 'bad-args', 'title': '', 'status': '', 'started': ''}
+        res.pop('ident', None)
+        if len(argv) > 4 and argv[4] == 'us':
+            # \x1f-separated for bash: IFS=$'\t' would collapse empty fields.
+            print('\x1f'.join(tsv(x).replace('\x1f', ' ') for x in ('1' if res['ok'] else '0', ','.join(str(p) for p in res['pids']),
+                                             res['title'], res['status'], res['reason'], res['started'])))
+        else:
+            json.dump(res, sys.stdout, ensure_ascii=False)
+            print()
+        return 0
+    if mode == 'kill':
+        tool = argv[2] if len(argv) > 2 else ''
+        sid = argv[3] if len(argv) > 3 else ''
+        expect = argv[4] if len(argv) > 4 else ''
+        r = kill_session(tool, sid, expect) if tool in ('claude', 'codex') and sid and expect else \
+            {'result': 'refused', 'pids': []}
+        print('%s\x1f%s' % (r['result'], ','.join(str(p) for p in r['pids'])))
+        return 0
+    print('baton: unknown scanner mode %r' % mode, file=sys.stderr)
+    return 2
 
-    # Group by directory: most-recently-active group first, sessions by date.
-    gmax = {}
-    for r in rows:
-        gmax[r['cwd']] = max(gmax.get(r['cwd'], 0), r['mtime'])
-    rows.sort(key=lambda r: (-gmax[r['cwd']], r['cwd'], -r['mtime']))
-
-    # --all has a generous safety cap; default view is already bounded by the
-    # loop (all active + RECENT_INACTIVE) so it isn't truncated here.
-    if show_all:
-        rows = rows[:40]
-
-    # ANSI colors (fzf --ansi renders these).
-    C_DIR = '\033[1;36m'   # bold cyan folder header
-    C_DOT = '\033[1;32m'   # green live dot
-    C_TOOL= '\033[35m'     # magenta tool name
-    C_AGE = '\033[90m'     # dim age
-    C_TXT = '\033[37m'     # prompt text
-    C_OFF = '\033[0m'
-
-    # One line per session. A folder header row is emitted once per group; its
-    # tab-fields carry no session id, so selecting it is a no-op (guarded later).
-    # Session rows are indented and always self-describing (tool · age · prompt).
-    prev = None
-    home = os.path.expanduser('~')
-    for r in rows:
-        if r['cwd'] != prev:
-            prev = r['cwd']
-            disp_dir = r['cwd'].replace(home, '~')
-            header = "%s%s%s" % (C_DIR, disp_dir, C_OFF)
-            # header row: empty id/path -> not selectable
-            print('\t'.join(['', '', '', r['cwd'], '0', '', header]))
-        dot = ("%s●%s" % (C_DOT, C_OFF)) if r['active'] else ' '
-        a   = "%s%4s%s" % (C_AGE, ago(r['mtime']), C_OFF)
-        tool= "%s%-6s%s" % (C_TOOL, r['tool'], C_OFF)
-        txt = "%s%s%s" % (C_TXT, r['prompt'][:80], C_OFF)
-        disp = "  %s %s %s  %s" % (dot, tool, a, txt)
-        print('\t'.join([r['path'], r['tool'], r['id'], r['cwd'], str(r['active']), r['pids'], disp]))
-
-if mode == 'preview':
-    preview(sys.argv[2], sys.argv[3])
-else:
-    show_all = (len(sys.argv) > 2 and sys.argv[2] == '1')
-    build(show_all)
+try:
+    sys.exit(main(sys.argv))
+except BrokenPipeError:
+    sys.exit(0)
 PY
 }
 
 # --- preview reentry --------------------------------------------------------
 if [ "${1:-}" = "--preview" ]; then
   shift
-  # Folder header rows pass an empty path; nothing to preview.
-  if [ -z "${1:-}" ]; then
-    echo "  (folder — pick a session below it)"
-    exit 0
-  fi
+  # Folder rows pass an empty path plus a small folder card; status rows pass nothing.
+  [ -n "${1:-}${3:-}" ] || exit 0
   _scan preview "$@"
   exit 0
 fi
@@ -364,9 +1949,6 @@ fi
 # ($SELF), which is both PATH-independent and recursion-proof (a bare `baton`
 # would re-enter the function). Needs no python3/fzf/tty, so it runs before those.
 if [ "${1:-}" = "shell-init" ]; then
-  # Bake in an ABSOLUTE path so the function works from any cwd. $SELF is already
-  # absolute when baton is invoked via PATH (installed case); absolutize it here
-  # so a relative dev invocation (./bin/baton shell-init) is also correct.
   bin="$SELF"
   case "$bin" in
     /*) : ;;
@@ -393,18 +1975,164 @@ EOF
 fi
 
 command -v python3 >/dev/null 2>&1 || { echo "$PROG: python3 required" >&2; exit 1; }
-command -v fzf     >/dev/null 2>&1 || { echo "$PROG: fzf required" >&2; exit 1; }
 
-# Args are order-independent: --emit (internal: print selection instead of
-# resuming, for the shell function) and -a/--all (include closed sessions).
+# --- non-interactive entry points (no fzf / tty needed) ---------------------
+case "${1:-}" in
+  --dump)       _scan dump; exit $? ;;
+  --stats)      _scan stats; exit $? ;;
+  --kill-check) shift; _scan kill-check "$@"; exit $? ;;
+  --kill)       shift; _scan kill "$@"; exit $? ;;
+esac
+
+# --- UI state -----------------------------------------------------------------
+# Mutable UI state (tool filter, all-mode, expanded folders, unfolded parents)
+# lives in ONE small file ($BATON_STATE), one key=value per line, values
+# %-encoded so any path round-trips. Only the key dispatcher (--key) writes it, in
+# pure bash — one process per key. The QUERY is never stored: fzf hands {q} to
+# every render and key, so typing can't race a state write.
+ST_tool=both ST_all=0 ST_expanded='' ST_unfolded=''
+
+_st_load() {
+  [ -n "${BATON_STATE:-}" ] && [ -f "$BATON_STATE" ] || return 0
+  local k v
+  while IFS='=' read -r k v; do
+    case "$k" in
+      tool) ST_tool=$v ;;
+      all) ST_all=$v ;;
+      expanded) ST_expanded=$v ;;
+      unfolded) ST_unfolded=$v ;;
+    esac
+  done <"$BATON_STATE"
+  case "$ST_tool" in both|claude|codex) ;; *) ST_tool=both ;; esac
+}
+
+_st_save() {
+  [ -n "${BATON_STATE:-}" ] || return 0
+  local tmp="$BATON_STATE.$$.tmp"
+  printf 'tool=%s\nall=%s\nexpanded=%s\nunfolded=%s\n' \
+    "$ST_tool" "$ST_all" "$ST_expanded" "$ST_unfolded" >"$tmp" &&
+    mv -f "$tmp" "$BATON_STATE"
+}
+
+# %-encode $1 byte-wise (bash 3.2: printf "'c" sign-extends high bytes, so mask).
+_enc() {
+  local LC_ALL=C s="$1" out="" c h d i=0 n
+  n=${#s}
+  while [ "$i" -lt "$n" ]; do
+    c="${s:$i:1}"
+    case "$c" in
+      [A-Za-z0-9._~/-]) out="$out$c" ;;
+      *) printf -v d '%d' "'$c"; printf -v h '%%%02X' "$(( d & 255 ))"; out="$out$h" ;;
+    esac
+    i=$((i + 1))
+  done
+  printf '%s' "$out"
+}
+
+# Space-separated sets of encoded items (encoded items never contain spaces).
+_has() { case " $1 " in *" $2 "*) return 0 ;; esac; return 1; }
+_add() { if _has "$1" "$2"; then printf '%s' "$1"; else printf '%s' "${1:+$1 }$2"; fi; }
+_del() {
+  local out='' x
+  # shellcheck disable=SC2086  # intentional word split of an encoded set
+  for x in $1; do [ "$x" = "$2" ] || out="${out:+$out }$x"; done
+  printf '%s' "$out"
+}
+
+_prompt_text() {
+  local p=$ST_tool
+  [ "$ST_all" = 1 ] && p="$p+all"
+  printf '%s> ' "$p"
+}
+
+# --render <query> [initial]: rows for the current state + query (fzf's {q}).
+# Empty query -> the Open+Recent list; otherwise unified search. The single row
+# source for the picker and
+# every reload. FZF_LINES is exported by fzf to reload subprocesses; the initial
+# render (no fzf yet, stdout captured so `tput` can't see the terminal) uses the
+# BATON_LINES the picker read from /dev/tty.
+if [ "${1:-}" = "--render" ]; then
+  h="${FZF_LINES:-${BATON_LINES:-}}"
+  [ -n "$h" ] || h="$(tput lines 2>/dev/null || echo 0)"
+  _scan render "$h" "${2:-}" "${3:-}"
+  exit $?
+fi
+
+# --key <name> <query> [arg...]: the fzf bind dispatcher for everything except
+# typing. Mutates state, then PRINTS the fzf action string to run (these binds
+# are transform actions). +, =, → and ← act on the list only while the query is
+# empty; while typing they keep their editing meaning (so "C++" / "a=b" work).
+# Typing itself is a plain async `change:reload` (a synchronous transform there
+# drops fast keystrokes).
+if [ "${1:-}" = "--key" ]; then
+  key="${2:-}"; q="${3:-}"; a1="${4:-}"; a2="${5:-}"
+  _st_load
+  selfq=$(printf '%q' "$SELF")
+  # List actions keep the cursor on the same row (one-off track-current, matched
+  # by --id-nth). Never while typing: tracking blocks query input until the row
+  # reappears, and fzf drops keys typed meanwhile.
+  rl="reload($selfq --render {q})"
+  trl="track-current+$rl"
+  [ -n "$q" ] && trl=$rl
+  case "$key" in
+    ctrl-t)
+      case "$ST_tool" in both) ST_tool=claude ;; claude) ST_tool=codex ;; *) ST_tool=both ;; esac
+      _st_save; printf 'change-prompt(%s)+%s' "$(_prompt_text)" "$trl" ;;
+    ctrl-a)
+      if [ "$ST_all" = 1 ]; then ST_all=0; else ST_all=1; fi
+      _st_save; printf 'change-prompt(%s)+%s' "$(_prompt_text)" "$trl" ;;
+    plus|equal)
+      if [ -n "$q" ]; then
+        if [ "$key" = plus ]; then printf 'put(+)'; else printf 'put(=)'; fi
+      elif [ -n "$a1" ]; then
+        e=$(_enc "$a1")
+        if _has "$ST_expanded" "$e"; then ST_expanded=$(_del "$ST_expanded" "$e")
+        else ST_expanded=$(_add "$ST_expanded" "$e"); fi
+        _st_save; printf '%s' "$trl"
+      else
+        printf 'ignore'
+      fi ;;
+    right)                                    # unfold the hovered session's subagents
+      if [ -n "$q" ]; then printf 'forward-char'
+      elif [ "$a2" = session ] && [ -n "$a1" ]; then
+        ST_unfolded=$(_add "$ST_unfolded" "$(_enc "$a1")"); _st_save; printf '%s' "$trl"
+      else printf 'ignore'; fi ;;
+    left)                                     # fold (from the parent or any child)
+      if [ -n "$q" ]; then printf 'backward-char'
+      elif [ -n "$a1" ] && { [ "$a2" = child ] || _has "$ST_unfolded" "$(_enc "$a1")"; }; then
+        ST_unfolded=$(_del "$ST_unfolded" "$(_enc "$a1")"); _st_save; printf '%s' "$trl"
+      else printf 'ignore'; fi ;;
+    resize)                                   # re-fill to the new height (list only)
+      if [ -z "$q" ]; then printf '%s' "$trl"; else printf 'ignore'; fi ;;
+    esc)                                      # typing: clear (change reloads); else quit
+      if [ -n "$q" ]; then printf 'clear-query'; else printf 'abort'; fi ;;
+    *) printf 'ignore' ;;
+  esac
+  exit 0
+fi
+
+# Args are order-independent:
+#   --emit              internal: print selection instead of resuming (shell fn)
+#   -a/--all            start with automated / superseded sessions shown (ctrl-a)
+#   --tool X            initial tool filter: both|claude|codex (default both)
 emit=0
-show_all=0
+tool='both'
+all=0
+prev=''
 for arg in "$@"; do
+  if [ "$prev" = "--tool" ]; then
+    case "$arg" in claude|codex|both) tool="$arg" ;; esac
+    prev=''; continue
+  fi
   case "$arg" in
-    --emit)   emit=1 ;;
-    -a|--all) show_all=1 ;;
+    --emit)      emit=1 ;;
+    -a|--all)    all=1 ;;
+    --tool)      prev='--tool' ;;
+    --tool=*)    case "${arg#--tool=}" in claude|codex|both) tool="${arg#--tool=}" ;; esac ;;
   esac
 done
+
+command -v fzf >/dev/null 2>&1 || { echo "$PROG: fzf required" >&2; exit 1; }
 
 # The picker draws on the controlling terminal (/dev/tty), so REQUIRE one. We test
 # /dev/tty rather than stdout because in --emit mode stdout is a capture pipe
@@ -414,50 +2142,119 @@ if ! { : >/dev/tty; } 2>/dev/null; then
   exit 1
 fi
 
-rows=$(_scan list "$show_all")
+SELFq=$(printf '%q' "$SELF")
 
-if [ -z "$rows" ]; then
+BATON_STATE="$(mktemp -t baton-state.XXXXXX)" && [ -n "$BATON_STATE" ] || {
+  echo "$PROG: cannot create a temporary state file" >&2; exit 1; }
+export BATON_STATE
+# The folder baton was launched from floats to the top of the list.
+BATON_ORIGIN="$PWD"
+export BATON_ORIGIN
+_cleanup() {
+  [ -n "${BATON_STATE:-}" ] || return 0     # never glob relative to the cwd
+  rm -f "$BATON_STATE" "$BATON_STATE.q" "$BATON_STATE".*.tmp 2>/dev/null
+}
+trap _cleanup EXIT
+ST_tool=$tool; ST_all=$all; _st_save
+
+# `tput lines` inside $(...) sees a pipe and answers 24; ask the tty itself.
+BATON_LINES=$(stty size </dev/tty 2>/dev/null | cut -d' ' -f1)
+export BATON_LINES
+rows=$("$SELF" --render '' initial)
+if [ $? -eq 3 ]; then
   # On stderr so --emit's stdout stays empty (the function treats that as a no-op).
   echo "No claude/codex sessions found." >&2
   exit 0
 fi
 
-hdr="enter resume · esc quit"
-[ "$show_all" = 0 ] && hdr="● live + 10 recent · $hdr · ($PROG --all for everything)"
+# Two short header lines (they must fit the narrow list pane). The first input
+# row is a status line (hidden counts / match count), pinned via --header-lines.
+hdr=$'type to search · enter resume · esc clear/quit\n+ folder · →/← subagents · ctrl-a automated · ctrl-t tool'
 
+# Baton owns filtering (fzf --disabled): `change` drives an async reload of
+# unified name+content results (fzf's documented `change:reload {q}` pattern).
+# --id-nth names each row's identity so list actions can keep the cursor on it
+# (track-current) even though the display (ages) changes. No global --track:
+# with --id-nth it blocks typing during every reload. The preview card is 7 lines, kept
+# sticky with ~7; `follow` shows the END of the transcript (the newest turn) a
+# full pane high. --sync + start:down put the cursor on the first session, not
+# the first folder header.
 sel=$(printf '%s\n' "$rows" | fzf \
   --ansi \
+  --disabled \
   --delimiter='\t' \
-  --with-nth=7 \
+  --with-nth=10 \
+  --header-lines=1 \
   --no-sort \
+  --no-wrap \
+  --no-hscroll \
+  --id-nth=1,3,5,7 \
   --layout=reverse \
-  --prompt='resume> ' \
+  --prompt="$(_prompt_text)" \
   --header="$hdr" \
-  --preview="$SELF --preview {1} {2}" \
-  --preview-window='right,55%,wrap' \
-  --bind='esc:abort')
+  --preview="$SELFq --preview {1} {2} {9}" \
+  --preview-window='right,40%,wrap,~7,follow' \
+  --sync \
+  --bind='start:down' \
+  --bind="ctrl-t:transform($SELFq --key ctrl-t {q})" \
+  --bind="ctrl-a:transform($SELFq --key ctrl-a {q})" \
+  --bind="+:transform($SELFq --key plus {q} {5})" \
+  --bind="=:transform($SELFq --key equal {q} {5})" \
+  --bind="right:transform($SELFq --key right {q} {6} {7})" \
+  --bind="left:transform($SELFq --key left {q} {6} {7})" \
+  --bind="change:reload($SELFq --render {q})" \
+  --bind="esc:transform($SELFq --key esc {q})" \
+  --bind="resize:transform($SELFq --key resize {q})" \
+  --bind='enter:transform([ -n {3} ] && echo accept || echo ignore)')
 [ -z "$sel" ] && exit 0
 
-# Parse the chosen TSV line. Fields 1 (path) and 7 (display) are consumed only
-# by fzf (preview callback / display column), so they're discarded here as `_`.
-IFS=$'\t' read -r _ tool id cwd active pids _ <<<"$sel"
-# Folder header rows have no id — selecting one exits cleanly with no stdout, so
-# the shell function treats it as a no-op.
+# Parse the chosen TSV row: the resume target (fields 2-4). Tabs become
+# \x1f first: tab is IFS whitespace, so `read` would collapse EMPTY fields and
+# shift every later one (a row without subagents has an empty field 6).
+sel=${sel//$'\t'/$'\x1f'}
+IFS=$'\x1f' read -r _ tool id cwd _ _ _ _ _ _ <<<"$sel"
+# Folder / status rows (and children whose parent isn't resumable) have no id.
 [ -z "$id" ] && exit 0
 
-# If live, confirm and end the existing process so work can't diverge. All of
-# this is user interaction → route to /dev/tty so --emit's stdout stays clean
-# (only the final metadata line may land on stdout).
-if [ "$active" = "1" ] && [ -n "$pids" ]; then
+# Live handling, run for EVERY selection (a row that looked closed may have
+# been resumed elsewhere since the list was drawn). Everything here is user
+# interaction -> /dev/tty so --emit's stdout stays clean. A process is ended only
+# when the scanner proves which process holds this session; `--kill` re-proves
+# it and signals in one step, and baton resumes only once it has really exited.
+# An unproven "maybe" only warns.
+info=$("$SELF" --kill-check "$tool" "$id" us)
+IFS=$'\x1f' read -r ok pids title status reason started <<<"$info"
+if [ "$ok" = 1 ]; then
   {
-    echo "This session is LIVE (pid(s): $pids) in: $cwd"
-    printf "End that process and resume here? [y/N] "
+    printf 'This session is LIVE: "%s" (%s, pid %s%s)\n' "$title" "$tool" "$pids" "${status:+, $status}"
+    printf 'End that process and resume here? [y/N] '
   } >/dev/tty
   read -r ans </dev/tty
   case "$ans" in
-    y|Y) for p in ${pids//,/ }; do kill "$p" 2>/dev/null; done; sleep 1 ;;
-    *)   echo "cancelled" >/dev/tty; exit 0 ;;
+    y|Y)
+      res=$("$SELF" --kill "$tool" "$id" "$pids")
+      IFS=$'\x1f' read -r outcome left <<<"$res"
+      case "$outcome" in
+        ended) : ;;
+        changed)
+          echo "$PROG: the live process changed since you were asked; nothing was ended." >/dev/tty
+          exit 1 ;;
+        unknown)
+          echo "$PROG: couldn't confirm pid $pids exited; not resuming (check it, then retry)." >/dev/tty
+          exit 1 ;;
+        *)
+          echo "$PROG: pid ${left:-$pids} is still running; not resuming (end it yourself, then retry)." >/dev/tty
+          exit 1 ;;
+      esac ;;
+    *) echo "cancelled" >/dev/tty; exit 0 ;;
   esac
+elif [ "$reason" = maybe ] && [ -n "$pids" ]; then
+  {
+    printf 'A %s process (pid %s, started %s UTC) is running in this folder;\n' "$tool" "$pids" "$started"
+    printf "baton can't tell which session it holds. Resume anyway? [y/N] "
+  } >/dev/tty
+  read -r ans </dev/tty
+  case "$ans" in y|Y) : ;; *) echo "cancelled" >/dev/tty; exit 0 ;; esac
 fi
 
 # --emit: hand the selection back to the shell function, which does the cd +
@@ -468,12 +2265,11 @@ if [ "$emit" = "1" ]; then
 fi
 
 # Fallback (bare binary, no shell function in play — e.g. fresh `ssh -t host
-# baton`): cd then exec resume. Resume works, but the parent shell can't be
-# moved from a child, so it stays put. Install the shell integration
-# (`eval "$(baton shell-init bash)"`) to be left in $cwd after the session.
-# Plain `exec claude`/`exec codex` (NOT `exec command claude`): in exec position
-# `command` is a program name, not the builtin — relying on /usr/bin/command
-# existing is a portability trap (absent on many Linux boxes).
+# baton`): cd then exec resume. The parent shell can't be moved from a child, so
+# it stays put. Plain `exec claude`/`exec codex` (NOT `exec command claude`): in
+# exec position `command` is a program name, not the builtin.
+# exec replaces this process, so the EXIT trap won't fire — clean up state now.
+_cleanup
 cd "$cwd" 2>/dev/null || { echo "$PROG: cannot cd to $cwd" >&2; exit 1; }
 echo "Resuming $tool in $cwd …" >&2
 if [ "$tool" = "claude" ]; then
