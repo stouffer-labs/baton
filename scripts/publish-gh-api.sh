@@ -270,6 +270,7 @@ ALLOWLIST=(
   "docs/design-history.md"
   "scripts/install.sh"
   "scripts/publish-gh-api.sh"
+  "tests/test_baton.py"
 )
 
 collect_allowlist_files() {
