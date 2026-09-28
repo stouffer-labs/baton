@@ -38,3 +38,30 @@ jobs:
           compile(m.group(1), 'embedded-scanner', 'exec')
           print("embedded python compiles clean")
           PY
+
+  test:
+    name: Fixture tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      # Stock macOS ships bash 3.2 as /bin/bash; baton must keep working there.
+      - name: Unit tests under /bin/bash 3.2
+        if: runner.os == 'macOS'
+        run: |
+          PY="$(command -v python3)"
+          PATH="/bin:/usr/bin:$(dirname "$PY")" bash --version | head -1
+          PATH="/bin:/usr/bin:$(dirname "$PY")" "$PY" -m unittest discover -s tests
