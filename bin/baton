@@ -1373,14 +1373,15 @@ def emit_status(text):
     emit('', '', '', '', '', '', 'status', '', '', C_HDR + text + C_OFF)
 
 def origin_folder(cwds):
-    o = (os.environ.get('BATON_ORIGIN') or '').rstrip('/')
+    o = (os.environ.get('BATON_ORIGIN') or '')
     if not o:
         return None
+    o = o.rstrip('/') or '/'
     best = None
     for c in cwds:
         if not c or (c == HOME and o != HOME):
             continue
-        if o == c or o.startswith(c.rstrip('/') + '/'):
+        if o == c or o.startswith((c.rstrip('/') or '') + '/'):
             if best is None or len(c) > len(best):
                 best = c
     return best
@@ -1409,7 +1410,10 @@ def group_sort(rows, origin):
     for s in rows:
         gmax[s['cwd']] = max(gmax.get(s['cwd'], 0), s['updated'])
         glive[s['cwd']] = glive.get(s['cwd'], False) or bool(s['live'])
-    rows.sort(key=lambda s: (0 if glive[s['cwd']] else 1, 0 if s['cwd'] == origin else 1,
+    # The folder baton was launched from comes FIRST, ahead of live folders and
+    # however old its sessions are: "what did I last run here?" is the question
+    # you have when you open baton inside a project.
+    rows.sort(key=lambda s: (0 if s['cwd'] == origin else 1, 0 if glive[s['cwd']] else 1,
                              -gmax[s['cwd']], s['cwd'], 0 if s['live'] else 1, -s['updated']))
     return rows
 
@@ -1457,6 +1461,17 @@ def list_view(height, st, idx):
     if origin:                               # 2) the launch folder's newest few
         for s in [r for r in rows if r['cwd'] == origin and key(r) not in show][:5]:
             take(s)
+    elif os.environ.get('BATON_ORIGIN'):     # nothing visible from here: say why
+        emit_status(hidden_note(st, idx, tops, kids))
+        # Sessions may exist here but be hidden by the tool filter / all-mode.
+        any_here = origin_folder({s['cwd'] for s in idx['sessions'] if s['kind'] != 'child'})
+        if any_here:
+            emit_header(any_here, ' %s(nothing here for this filter · ctrl-t / ctrl-a)%s' % (C_HINT, C_OFF),
+                        True, {'n': 0, 'hid': True})
+        else:
+            here = os.environ['BATON_ORIGIN'].rstrip('/') or '/'
+            emit_header(here, ' %s(no sessions here yet)%s' % (C_HINT, C_OFF), True, {'n': 0})
+        used += 1
     for s in sorted(rows, key=lambda r: -r['updated']):    # 3) fill by recency
         if used >= budget:
             break
@@ -1465,7 +1480,8 @@ def list_view(height, st, idx):
         if used + 1 + (0 if s['cwd'] in folders else 1) > budget:
             continue                         # too expensive now; a cheaper one may fit
         take(s)
-    emit_status(hidden_note(st, idx, tops, kids))
+    if origin or not os.environ.get('BATON_ORIGIN'):
+        emit_status(hidden_note(st, idx, tops, kids))
     shown_per = {}
     for s in rows:
         if key(s) in show:
@@ -1841,6 +1857,16 @@ def transcript(path, tool):
 def print_folder(c, width):
     W = max(20, width - 1)
     print(P_TITLE + fit(tilde(c.get('f') or ''), W) + P_OFF)
+    if c.get('n') == 0:
+        if c.get('hid'):
+            print(P_DIM + fit('Sessions were started here, but the current view hides them.', W) + P_OFF)
+            print()
+            print(fit('ctrl-t changes the tool filter; ctrl-a shows automated runs.', W))
+        else:
+            print(P_DIM + fit('No claude or codex session was started here yet.', W) + P_OFF)
+            print()
+            print(fit('The sessions below are from other folders.', W))
+        return
     if 'n' in c:
         n, lv, h = c.get('n', 0), c.get('lv', 0), c.get('h', 0)
         print(P_DIM + fit('%d session%s%s' % (n, '' if n == 1 else 's', (' · %d live' % lv) if lv else ''), W) + P_OFF)
@@ -2163,7 +2189,12 @@ ST_tool=$tool; ST_all=$all; _st_save
 BATON_LINES=$(stty size </dev/tty 2>/dev/null | cut -d' ' -f1)
 export BATON_LINES
 rows=$("$SELF" --render '' initial)
-if [ $? -eq 3 ]; then
+rc=$?
+# Leading rows with no resume id (field 3) after the status row are headers.
+lead=$(printf '%s\n' "$rows" | tail -n +2 | awk -F'\t' '$3 != "" {exit} {n++} END {print n+0}')
+start_moves=down; i=1
+while [ "$i" -lt "$lead" ]; do start_moves="$start_moves+down"; i=$((i + 1)); done
+if [ $rc -eq 3 ]; then
   # On stderr so --emit's stdout stays empty (the function treats that as a no-op).
   echo "No claude/codex sessions found." >&2
   exit 0
@@ -2179,8 +2210,9 @@ hdr=$'type to search · enter resume · esc clear/quit\n+ folder · →/← suba
 # (track-current) even though the display (ages) changes. No global --track:
 # with --id-nth it blocks typing during every reload. The preview card is 7 lines, kept
 # sticky with ~7; `follow` shows the END of the transcript (the newest turn) a
-# full pane high. --sync + start:down put the cursor on the first session, not
-# the first folder header.
+# full pane high. --sync + start:<down…> put the cursor on the first SESSION
+# (past the status row and however many folder headers precede it, e.g. an
+# empty "here" folder followed by the first real one).
 sel=$(printf '%s\n' "$rows" | fzf \
   --ansi \
   --disabled \
@@ -2197,7 +2229,7 @@ sel=$(printf '%s\n' "$rows" | fzf \
   --preview="$SELFq --preview {1} {2} {9}" \
   --preview-window='right,40%,wrap,~7,follow' \
   --sync \
-  --bind='start:down' \
+  --bind="start:$start_moves" \
   --bind="ctrl-t:transform($SELFq --key ctrl-t {q})" \
   --bind="ctrl-a:transform($SELFq --key ctrl-a {q})" \
   --bind="+:transform($SELFq --key plus {q} {5})" \
