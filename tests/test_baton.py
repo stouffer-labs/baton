@@ -1500,6 +1500,61 @@ class RenderTests(BatonCase):
         self.assertEqual(folders, [b, a])
         self.assertIn('here', [r for r in rows if r[6] == 'folder'][0][9])
 
+    def test_launch_folder_beats_a_live_folder(self):
+        live_dir = self.work('live')
+        here = self.work('here')
+        now = time.time()
+        s1, s2 = new_uuid(), new_uuid()
+        self.claude_session(live_dir, c_basic(s1, live_dir, 'x', title='Live Title'), sid=s1, mtime=now - 10)
+        self.claude_session(here, c_basic(s2, here, 'y', title='Old Title Here'), sid=s2, mtime=now - 90000)
+        self.claude_registry(4100, s1, live_dir)
+        self.proc(4100, [CLAUDE_BIN], live_dir)
+        rows = self.render(extra_env={'BATON_ORIGIN': here})
+        folders = [r[4] for r in rows if r[6] == 'folder']
+        self.assertEqual(folders, [here, live_dir])
+        self.assertEqual([r[6] for r in rows[:3]], ['status', 'folder', 'session'])
+        self.assertEqual(rows[2][2], s2)
+        rows = self.render('title', extra_env={'BATON_ORIGIN': here})   # search: both match, here first
+        self.assertEqual([r[4] for r in rows if r[6] == 'folder'], [here, live_dir])
+
+    def test_root_origin_is_preserved(self):
+        sid = new_uuid()
+        self.claude_session('/', c_basic(sid, '/', 'at root', title='Root Session'), sid=sid)
+        rows = self.render(extra_env={'BATON_ORIGIN': '/'})
+        folders = [r for r in rows if r[6] == 'folder']
+        self.assertEqual([r[4] for r in folders], ['/'])
+        self.assertIn('here', folders[0][9])
+        self.assertNotIn('no sessions here yet', folders[0][9])
+
+    def test_launch_folder_hidden_by_filter_says_so(self):
+        here = self.work('here')
+        tid, row = self.codex_thread(here, name='Codex Only')
+        self.codex_db([row])
+        rows = self.render(state='tool=claude\nall=0\nexpanded=\nunfolded=\n',
+                           extra_env={'BATON_ORIGIN': here})
+        hdr = [r for r in rows if r[6] == 'folder'][0]
+        self.assertEqual(hdr[4], here)
+        self.assertIn('for this filter', hdr[9])
+        self.assertNotIn('no sessions here yet', hdr[9])
+        p = subprocess.run([str(BATON), '--preview', '', '', hdr[8]], env=self.env(),
+                           capture_output=True, text=True, timeout=TIMEOUT, start_new_session=True)
+        self.assertIn('current view hides them', p.stdout)
+
+    def test_launch_folder_without_sessions_shows_an_empty_header(self):
+        a = self.work('aaa')
+        nowhere = self.work('nowhere')
+        sid = new_uuid()
+        self.claude_session(a, c_basic(sid, a, 'x', title='In A'), sid=sid)
+        rows = self.render(extra_env={'BATON_ORIGIN': nowhere})
+        self.assertEqual([r[6] for r in rows[:4]], ['status', 'folder', 'folder', 'session'])
+        self.assertEqual(rows[1][4], nowhere)
+        self.assertIn('no sessions here yet', rows[1][9])
+        self.assertEqual(rows[1][2], '')                     # not selectable
+        self.assertEqual(rows[2][4], a)
+        p = subprocess.run([str(BATON), '--preview', '', '', rows[1][8]], env=self.env(),
+                           capture_output=True, text=True, timeout=TIMEOUT, start_new_session=True)
+        self.assertIn('No claude or codex session was started here yet', p.stdout)
+
     def test_kill_check_us_format_keeps_empty_fields(self):
         cwd, parent, closed, sdk = self.fixture()
         p = self.run_baton('--kill-check', 'claude', closed, 'us')
