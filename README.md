@@ -71,7 +71,7 @@ The top line of the list says how many sessions are hidden. The right pane start
 
 ### Default view
 
-With an empty search box the list pins every live session, marked `●`. A yellow dot means it's busy and a green one means it's idle. Then it fills the rest of the terminal with your most recent sessions. They're grouped under their folders with the newest first. The folder you started baton from comes right after the live ones and is marked `· here`. A folder with more history shows a `(+N older)` hint, and `+` opens it up. To reach an old project that isn't shown, type its name.
+With an empty search box the list pins every live session, marked `●`. A yellow dot means it's busy and a green one means it's idle. The folder you started baton from always comes first, marked `· here`, so you can see straight away what you last ran there and whether it was claude or codex. That holds even when its sessions are older than everything else, and when nothing was ever run there the header says so. Live sessions come next. Then it fills the rest of the terminal with your most recent sessions, grouped under their folders with the newest first. A folder with more history shows a `(+N older)` hint, and `+` opens it up. To reach an old project that isn't shown, type its name.
 
 ### Live sessions
 
