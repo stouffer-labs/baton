@@ -13,6 +13,9 @@
 # fill the terminal with the most recent closed ones, grouped by the directory
 # each was started in; the folder you launched from floats up. + (or =) expands
 # the hovered folder; type to search names + content; ctrl-t cycles the tool.
+# ctrl-o WATCHES the highlighted session instead: a read-only live feed of its
+# transcript (prompts, replies, tool calls, failures, status) that never
+# touches the session; q returns to the list.
 # Selecting a session:
 #   * if it is live AND baton can prove which process holds it (Claude's
 #     ~/.claude/sessions/<pid>.json registry, Codex's thread-writer lock), offers
@@ -31,6 +34,7 @@
 #         baton shell-init [bash|zsh]         # print the shell function (for eval)
 #         baton --stats | --dump              # session counts / full index as JSON
 #         baton --emit [--tool X]             # internal: print selection, don't resume
+#         baton --watch-session PATH [CARD] [--once]   # internal: the ctrl-o viewer
 # Run from Windows with:  ssh -t <mac-host> baton
 #
 # Bash here stays 3.2-compatible (stock macOS /bin/bash): no associative arrays,
@@ -881,13 +885,19 @@ def proc_table():
     """-> ({pid: {ppid, lstart, argv, cwd, open}}, test_mode). lstart is the
     process start in UTC ('Sun Sep 27 02:56:37 2026'), the format Claude's
     registry uses for procStart."""
+    procs, test, _ = proc_table_ok()
+    return procs, test
+
+def proc_table_ok():
+    """proc_table() plus whether ps (or the test fixture) answered at all:
+    watch reports a failed inspection as "unknown", never as "no process"."""
     tp = os.environ.get('BATON_TEST_PROCS')
     if tp:
         try:
             with open(tp) as fh:
                 lst = json.load(fh)
         except (OSError, ValueError):
-            lst = []
+            return {}, True, False
         procs = {}
         for p in lst if isinstance(lst, list) else []:
             try:
@@ -897,21 +907,21 @@ def proc_table():
                                         'cwd': p.get('cwd'), 'open': [str(x) for x in p.get('open_files') or []]}
             except (KeyError, TypeError, ValueError):
                 continue
-        return procs, True
+        return procs, True, True
     env = dict(os.environ, TZ='UTC', LC_ALL='C')
     try:
-        out = subprocess.run(['ps', '-A', '-ww', '-o', 'pid=,ppid=,lstart=,command='], capture_output=True,
-                             text=True, env=env, timeout=5).stdout
+        r = subprocess.run(['ps', '-A', '-ww', '-o', 'pid=,ppid=,lstart=,command='], capture_output=True,
+                           text=True, env=env, timeout=5)
     except (OSError, subprocess.SubprocessError):
-        return {}, False
+        return {}, False, False
     procs = {}
-    for line in out.splitlines():
+    for line in r.stdout.splitlines():
         parts = line.split()
         if len(parts) < 8 or not parts[0].isdigit():
             continue
         procs[int(parts[0])] = {'ppid': int(parts[1]) if parts[1].isdigit() else 0,
                                 'lstart': ' '.join(parts[2:7]), 'argv': parts[7:], 'cwd': None, 'open': None}
-    return procs, False
+    return procs, False, r.returncode == 0 and bool(procs)
 
 def proc_cwd(pid, procs, test):
     p = procs.get(pid) or {}
@@ -1016,6 +1026,11 @@ def codex_writers(procs):
 def codex_holders(procs, test, tuis, rollout_of):
     """tid -> [pids] from the thread-writer lock (or rollout file) a codex
     process holds open. rollout_of: realpath(rollout) -> tid."""
+    return codex_holders_ok(procs, test, tuis, rollout_of)[0]
+
+def codex_holders_ok(procs, test, tuis, rollout_of):
+    """codex_holders() plus whether lsof answered (a missing or timed-out
+    lsof is an unknown, not "nobody holds it")."""
     held = {}
     tui = set(tuis)
     if test:
@@ -1028,17 +1043,21 @@ def codex_holders(procs, test, tuis, rollout_of):
                     tid = rollout_of.get(os.path.realpath(f))
                     if tid:
                         held.setdefault(tid, []).append(pid)
-        return held
+        return held, True
     if not tuis:
-        return held
+        return held, True
     # Only the codex processes' own open files (-a -p): ~0.07 s, versus ~0.3 s
     # for asking lsof who holds the lock files (it then scans every process).
     try:
-        out = subprocess.run(['lsof', '-a', '-p', ','.join(str(p) for p in sorted(tui)),
-                              '-b', '-w', '-n', '-P', '-Fpn'],
-                             capture_output=True, text=True, timeout=5).stdout
+        r = subprocess.run(['lsof', '-a', '-p', ','.join(str(p) for p in sorted(tui)),
+                            '-b', '-w', '-n', '-P', '-Fpn'],
+                           capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
-        return held
+        return held, False
+    out = r.stdout
+    # lsof exits 1 when one of the pids vanished meanwhile, yet still lists the
+    # rest; only a nonzero exit with no answer at all is a failed inspection.
+    ok = r.returncode == 0 or bool(out.strip())
     locks = os.path.realpath(CODEX_LOCKS)
     pid = None
     for ln in out.splitlines():
@@ -1053,7 +1072,7 @@ def codex_holders(procs, test, tuis, rollout_of):
                 tid = rollout_of.get(os.path.realpath(f))
                 if tid:
                     held.setdefault(tid, []).append(pid)
-    return held
+    return held, ok
 
 def codex_exact(procs, test, writers, codex_ids, rollout_of):
     """tid -> pids PROVEN to write that thread: the holder of its
@@ -1687,10 +1706,10 @@ def print_card(c, width):
     kind = c.get('k', '')
     lines = [P_TITLE + fit(c.get('t') or '(session)', W) + P_OFF]
     if c.get('l') == 'exact':
-        live = '● live%s pid %s' % ((' (%s)' % c['st']) if c.get('st') else '',
-                                   ','.join(str(p) for p in c.get('p') or []))
+        live = '● live%s pid %s · ctrl-o watch' % ((' (%s)' % c['st']) if c.get('st') else '',
+                                                  ','.join(str(p) for p in c.get('p') or []))
     elif c.get('l') == 'maybe':
-        live = '◌ a %s process is running in this folder' % tool
+        live = '◌ a %s process is running in this folder · ctrl-o watch' % tool
     else:
         live = 'not running'
     bits = [tool]
@@ -1900,6 +1919,915 @@ def preview_main(path, tool, card):
     print_card(c, width)
     transcript(path, tool)
 
+# ---------- watch: read-only live view ----------
+# ctrl-o hands the terminal to watch_main(), which follows ONE session's
+# transcript and never touches the session: it opens the transcript and the
+# registry read-only, runs only ps/lsof, writes nothing, sends no signal,
+# connects to no socket, and never builds the index (so not even baton's own
+# cache is written).
+P_FAIL = '\033[1;31m'
+W_LABEL = 8                                   # 'Claude: ' / 'You:    ' label column
+W_MAX_REC = 8 * 1024 * 1024                   # one record past this is skipped, not parsed
+W_LABELS_MAX = 512                            # labels kept for tools still awaiting an outcome
+W_TAG_RE = re.compile(r'</?tool_use_error>')
+W_PATCH_RE = re.compile(r'^\*\*\* (?:Update|Add|Delete) File: (.+)$', re.M)
+W_EXIT_RE = re.compile(r'Exit code -?\d+')
+_SGR_RE = re.compile(r'\x1b\[[0-9;]*m')
+W_WAITING = ('permission prompt', 'input needed', 'sandbox request', 'worker request',
+             'dialog open', 'goal proposal')
+
+def _open_ro(path):
+    """Read-only, and never through a symlink planted at the path itself."""
+    return os.fdopen(os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)), 'rb')
+
+def watch_target(path):
+    """{'tool', 'path', 'sid', 'kind'} for a Claude or Codex transcript, else
+    None. The REAL path must lie inside ~/.claude/projects or ~/.codex, so
+    watch is never a general file viewer (a symlink out is refused)."""
+    try:
+        real = os.path.realpath(path)
+    except (OSError, ValueError):
+        return None
+    if not path or not real.endswith('.jsonl') or not os.path.isfile(real):
+        return None
+    croot = os.path.realpath(CLAUDE_PROJECTS)
+    if real.startswith(croot + os.sep):
+        parts = os.path.relpath(real, croot).split(os.sep)
+        stem = parts[-1][:-len('.jsonl')]
+        if len(parts) == 2 and UUID_RE.match(stem):
+            return {'tool': 'claude', 'path': real, 'sid': stem, 'kind': 'root'}
+        if len(parts) == 4 and parts[2] == 'subagents' and stem.startswith('agent-') and UUID_RE.match(parts[1]):
+            return {'tool': 'claude', 'path': real, 'sid': parts[1], 'kind': 'child'}
+        return None
+    xroot = os.path.realpath(CODEX_HOME)
+    if real.startswith(xroot + os.sep) and os.path.basename(real).startswith('rollout-'):
+        try:
+            with _open_ro(real) as fh:
+                d = json.loads(fh.readline(8 * 1024 * 1024))
+        except (OSError, ValueError):
+            return None
+        p = d.get('payload') if isinstance(d, dict) and d.get('type') == 'session_meta' else None
+        if not isinstance(p, dict) or not isinstance(p.get('id'), str):
+            return None
+        return {'tool': 'codex', 'path': real, 'sid': p['id'],
+                'kind': 'child' if codex_classify(p.get('source'))[0] == 'child' else 'root',
+                'cwd': p.get('cwd') if isinstance(p.get('cwd'), str) else ''}
+    return None
+
+def _compact(v):
+    try:
+        s = json.dumps(v, separators=(',', ':'), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return ''
+    return clean_line(s[:400])
+
+def _first_line(s):
+    for ln in clean_text(s if isinstance(s, str) else '').split('\n'):
+        if ln.strip():
+            return clean_line(ln)
+    return ''
+
+def _result_text(c):
+    """First line of a tool result (two when it starts with 'Exit code N')."""
+    if isinstance(c, list):
+        c = '\n'.join(b['text'] for b in c if isinstance(b, dict) and isinstance(b.get('text'), str))
+    if not isinstance(c, str):
+        return ''
+    lines = [clean_line(ln) for ln in clean_text(W_TAG_RE.sub('', c)).split('\n') if ln.strip()]
+    if not lines:
+        return ''
+    if W_EXIT_RE.fullmatch(lines[0]) and len(lines) > 1:
+        return '%s: %s' % (lines[0], lines[1])
+    return lines[0]
+
+def claude_tool_label(name, inp):
+    name = clean_line(name if isinstance(name, str) else '') or 'tool'
+    inp = inp if isinstance(inp, dict) else {}
+    def s(k):
+        v = inp.get(k)
+        return v if isinstance(v, str) else ''
+    if name.startswith('mcp__'):
+        parts = name.split('__')
+        if len(parts) >= 3 and parts[1] and parts[2]:
+            return '%s › %s' % (parts[1], '__'.join(parts[2:])), _compact(inp)
+        return name, _compact(inp)
+    if name == 'Bash':
+        arg = s('description') or s('command').strip().split('\n')[0]
+    elif name in ('Read', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'NotebookRead'):
+        arg = tilde(s('file_path') or s('notebook_path'))
+    elif name in ('Grep', 'Glob'):
+        arg = s('pattern')
+    elif name == 'WebFetch':
+        arg = s('url')
+    elif name in ('WebSearch', 'ToolSearch'):
+        arg = s('query')
+    elif name in ('Agent', 'Task'):
+        arg = ': '.join(x for x in (s('subagent_type'), s('description')) if x)
+    elif name == 'Skill':
+        arg = s('skill')
+    elif name == 'AskUserQuestion':
+        q = inp.get('questions')
+        arg = q[0].get('question', '') if isinstance(q, list) and q and isinstance(q[0], dict) else ''
+        arg = arg if isinstance(arg, str) else ''
+    elif name in ('TodoWrite', 'ExitPlanMode', 'EnterPlanMode'):
+        arg = ''
+    else:
+        arg = _compact(inp)
+    return name, clean_line(arg)
+
+def codex_tool_label(p):
+    pt = p.get('type')
+    if pt == 'web_search_call':
+        a = p.get('action') if isinstance(p.get('action'), dict) else {}
+        qs = a.get('queries') if isinstance(a.get('queries'), list) else []
+        q = a.get('query') or (qs[0] if qs else '') or a.get('url') or ''
+        return 'web_search', clean_line(q if isinstance(q, str) else '')
+    if pt == 'local_shell_call':
+        a = p.get('action') if isinstance(p.get('action'), dict) else {}
+        cmd = a.get('command')
+        return 'shell', clean_line(' '.join(x for x in cmd if isinstance(x, str)) if isinstance(cmd, list) else '')
+    name = clean_line(p.get('name') if isinstance(p.get('name'), str) else '') or 'tool'
+    if pt == 'custom_tool_call':
+        inp = p.get('input') if isinstance(p.get('input'), str) else ''
+        if name == 'apply_patch':
+            return 'apply_patch', clean_line(', '.join(f.strip() for f in W_PATCH_RE.findall(inp)))
+        return name, _first_line(inp)
+    try:
+        args = json.loads(p.get('arguments') or '{}')
+    except (TypeError, ValueError):
+        args = {}
+    args = args if isinstance(args, dict) else {}
+    ns = p.get('namespace') if isinstance(p.get('namespace'), str) else ''
+    if ns.startswith('mcp__'):
+        return '%s › %s' % (clean_line(ns[5:].strip('_')), name), _compact(args)
+    if name in ('exec_command', 'shell'):
+        cmd = args.get('cmd', args.get('command'))
+        if isinstance(cmd, list):
+            cmd = ' '.join(x for x in cmd if isinstance(x, str))
+        return 'shell', _first_line(cmd)
+    return name, _compact(args)
+
+class WatchFeed:
+    """Turns transcript records into feed events and keeps what the status
+    line needs: tools started but not finished (id -> (label, started)),
+    whether the model is thinking, and Codex's turn state (busy: True after
+    task_started, False after task_complete / turn_aborted, None = unseen).
+    Events: ('you'|'task'|'ai', text) · ('tool', label, arg) · ('fail',
+    label, msg) · ('note', text). Unknown records yield nothing."""
+
+    def __init__(self, tool, kind):
+        self.tool, self.kind = tool, kind
+        self.pending, self.labels = {}, {}
+        self.thinking, self.busy, self.last_api = False, None, None
+
+    def take_line(self, ln):
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            return []
+        if not isinstance(d, dict):
+            return []
+        try:
+            return self._claude(d) if self.tool == 'claude' else self._codex(d)
+        except (AttributeError, TypeError, ValueError, KeyError, IndexError):
+            return []                       # a shape this version doesn't know
+
+    def _who(self):
+        return 'task' if self.kind == 'child' else 'you'
+
+    def _start(self, tid, label, ts):
+        if isinstance(tid, str) and tid:
+            self.pending[tid] = (label, ts)
+            self.labels[tid] = label
+            for d in (self.pending, self.labels):     # outcomes that never came
+                while len(d) > W_LABELS_MAX:
+                    del d[next(iter(d))]
+
+    def _done(self, tid):
+        """A tool's outcome arrived: -> its label, forgotten."""
+        self.pending.pop(tid, None)
+        return self.labels.pop(tid, None)
+
+    def _turn_over(self):
+        self.pending.clear()
+        self.labels.clear()
+        self.thinking = False
+
+    def _claude(self, d):
+        t = d.get('type')
+        ts = parse_iso(d.get('timestamp'))
+        msg = d.get('message') if isinstance(d.get('message'), dict) else {}
+        c = msg.get('content')
+        if t == 'assistant':
+            if d.get('isApiErrorMessage'):
+                return [('fail', '', _first_line(_claude_msg_text(d)) or 'API error')]
+            self.last_api = None            # progress: a later identical API error is new
+            out = []
+            for b in c if isinstance(c, list) else ():
+                if not isinstance(b, dict):
+                    continue
+                bt = b.get('type')
+                if bt in ('thinking', 'redacted_thinking'):
+                    self.thinking = True
+                elif bt == 'text' and isinstance(b.get('text'), str) and b['text'].strip():
+                    self.thinking = False
+                    out.append(('ai', b['text']))
+                elif bt == 'tool_use':
+                    self.thinking = False
+                    label, arg = claude_tool_label(b.get('name'), b.get('input'))
+                    self._start(b.get('id'), label, ts)
+                    out.append(('tool', label, arg))
+            return out
+        if t == 'user':
+            if d.get('isMeta') or d.get('isCompactSummary'):
+                return []
+            self.last_api = None
+            if isinstance(c, list) and any(isinstance(b, dict) and b.get('type') == 'tool_result' for b in c):
+                out = []
+                for b in c:
+                    if isinstance(b, dict) and b.get('type') == 'tool_result':
+                        label = self._done(b.get('tool_use_id')) or 'tool'
+                        if b.get('is_error') is True:  # never guessed from the text
+                            out.append(('fail', label, _result_text(b.get('content'))))
+                return out
+            if d.get('promptSource') == 'system' or d.get('turnOrigin') not in (None, 'human'):
+                return []                   # task notifications, peer messages: not a person
+            text = (_claude_msg_text(d) or '').strip()
+            if text.startswith('[Request interrupted'):
+                self._turn_over()
+                return [('note', 'interrupted')]
+            m = CMD_RE.search(text)
+            if m:
+                am = ARGS_RE.search(text)
+                cmd = '/' + m.group(1).strip().lstrip('/')
+                return [(self._who(), clean_line('%s %s' % (cmd, am.group(1).strip() if am else '')))]
+            m = BASH_RE.search(text)
+            if m:
+                return [(self._who(), '! ' + clean_line(m.group(1)))]
+            if not text or SKIP_RE.match(text):
+                return []
+            text = BLOCK_RE.sub('', text).strip()
+            return [(self._who(), text)] if text else []
+        if t == 'system':
+            st = d.get('subtype')
+            if st == 'compact_boundary':
+                return [('note', 'conversation compacted')]
+            if st == 'api_error':
+                e = d.get('error') if isinstance(d.get('error'), dict) else {}
+                m = clean_line(e.get('formatted') or e.get('message') or '') or 'request failed'
+                if m == self.last_api:
+                    return []               # the same failure, retried back to back
+                self.last_api = m
+                n, mx = d.get('retryAttempt'), d.get('maxRetries')
+                lab = ('API error (retry %d/%d)' % (n, mx)) if isinstance(n, int) and isinstance(mx, int) \
+                    else 'API error'
+                return [('fail', '', '%s: %s' % (lab, m))]
+        return []
+
+    def _codex(self, d):
+        t, p = d.get('type'), d.get('payload')
+        if not isinstance(p, dict):
+            return []
+        ts = parse_iso(d.get('timestamp'))
+        pt = p.get('type')
+        if t == 'response_item':
+            # Messages come from here only: 0.162 repeats each one as an
+            # item_completed, and task_complete repeats the last answer.
+            if pt == 'message':
+                role, text = codex_msg(d)
+                text = (text or '').strip()
+                if role == 'user' and text and not text.startswith(CODEX_INJECTED):
+                    return [(self._who(), text)]
+                if role == 'assistant' and text:
+                    self.thinking = False
+                    return [('ai', text)]
+                return []
+            if pt == 'reasoning':
+                self.thinking = True
+                return []
+            if pt in ('function_call', 'custom_tool_call', 'local_shell_call', 'web_search_call'):
+                self.thinking = False
+                label, arg = codex_tool_label(p)
+                if pt != 'web_search_call':
+                    self._start(p.get('call_id'), label, ts)
+                return [('tool', label, arg)]
+            if pt in ('function_call_output', 'custom_tool_call_output'):
+                self.pending.pop(p.get('call_id'), None)   # the label waits for item_completed
+            return []
+        if t != 'event_msg':
+            return []
+        if pt == 'task_started':
+            self.busy = True
+        elif pt in ('task_complete', 'turn_aborted'):
+            self.busy = False
+            self._turn_over()
+            if pt == 'turn_aborted':
+                r = clean_line(p.get('reason') if isinstance(p.get('reason'), str) else '')
+                return [('note', 'turn aborted (%s)' % r if r else 'turn aborted')]
+        elif pt == 'item_completed' and isinstance(p.get('item'), dict):
+            return self._codex_item(p['item'])
+        return []
+
+    def _codex_item(self, it):
+        """Outcomes. item.id is the call_id of the call that started it."""
+        k, iid, st = it.get('type'), it.get('id'), it.get('status')
+        if k == 'ContextCompaction':
+            return [('note', 'conversation compacted')]
+        if k not in ('CommandExecution', 'McpToolCall', 'FileChange'):
+            return []
+        label = self._done(iid)
+        if k == 'CommandExecution':
+            code = it.get('exit_code')
+            if st == 'declined':
+                return [('fail', label or 'shell', 'declined')]
+            if st == 'failed' or (isinstance(code, int) and code != 0):
+                out = _first_line(it.get('aggregated_output') or it.get('stderr') or it.get('stdout'))
+                head = ('exit %d' % code) if isinstance(code, int) else 'failed'
+                return [('fail', label or 'shell', '%s: %s' % (head, out) if out else head)]
+        elif k == 'McpToolCall':
+            res = it.get('result') if isinstance(it.get('result'), dict) else {}
+            err = it.get('error')
+            if st == 'failed' or res.get('isError') is True or err:
+                label = label or clean_line('%s › %s' % (it.get('server'), it.get('tool')))
+                msg = err.get('message') if isinstance(err, dict) else err
+                msg = _first_line(msg) or _result_text(res.get('content'))
+                return [('fail', label, msg or 'failed')]
+        elif st in ('failed', 'declined'):
+            err = _first_line(it.get('stderr'))
+            return [('fail', label or 'apply_patch', '%s: %s' % (st, err) if err else st)]
+        return []
+
+def _watch_tail(path, nbytes):
+    """(complete lines, offset just past the last one, truncated?) for the last
+    nbytes. A torn final line is left for the follower to read whole; the
+    first line is dropped only when the window starts inside it."""
+    try:
+        with _open_ro(path) as fh:
+            sz = os.fstat(fh.fileno()).st_size
+            start = max(0, sz - nbytes)
+            fh.seek(max(0, start - 1))
+            data = fh.read(sz - start + (1 if start else 0))
+    except OSError:
+        return None, 0, False
+    aligned = True
+    if start:
+        aligned, data = data[:1] == b'\n', data[1:]
+    end = data.rfind(b'\n') + 1
+    lines = data[:end].split(b'\n')[:-1]
+    if not aligned and lines:
+        lines = lines[1:]
+    return lines, start + end, start > 0
+
+def watch_backfill(t):
+    """(feed, events since the second-to-last prompt, offset). The whole
+    window is parsed, so the feed knows which tools are still running; only
+    the cut is shown. The window widens (2, 8, then 32 MB) until it holds two
+    prompts."""
+    for nbytes in (2, 8, 32):
+        lines, off, more = _watch_tail(t['path'], nbytes * 1024 * 1024)
+        if lines is None:
+            return WatchFeed(t['tool'], t['kind']), [], 0
+        feed = WatchFeed(t['tool'], t['kind'])
+        evs = []
+        for ln in lines:
+            evs.extend([('note', 'large entry skipped')] if len(ln) > W_MAX_REC else feed.take_line(ln))
+        asks = [i for i, ev in enumerate(evs) if ev[0] in ('you', 'task')]
+        if not more or len(asks) >= 2:
+            break
+    start = asks[-2] if len(asks) >= 2 else (asks[0] if asks else max(0, len(evs) - 40))
+    cut = [('note', 'older activity not shown (last 32 MB only)')] if more and len(asks) < 2 else []
+    return feed, cut + evs[start:], off
+
+def _read_json(path):
+    try:
+        with open(path) as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
+
+def _find_claude_transcript(sid):
+    """A Claude session's transcript, found by its id under any project dir
+    (never by rebuilding the folder slug)."""
+    if not isinstance(sid, str) or not UUID_RE.match(sid):
+        return None
+    try:
+        dirs = os.listdir(CLAUDE_PROJECTS)
+    except OSError:
+        return None
+    hits = [os.path.join(CLAUDE_PROJECTS, d, sid + '.jsonl') for d in dirs]
+    hits = [h for h in hits if os.path.isfile(h)]
+    return max(hits, key=lambda h: os.stat(h).st_mtime) if hits else None
+
+def _subagents_writing(t):
+    """Subagent transcripts of a Claude session written in the last 30 s."""
+    d = os.path.join(os.path.dirname(t['path']), t['sid'], 'subagents')
+    try:
+        names = [n for n in os.listdir(d) if n.endswith('.jsonl')]
+    except OSError:
+        return 0
+    now, n = time.time(), 0
+    for name in names:
+        try:
+            n += now - os.stat(os.path.join(d, name)).st_mtime < 30
+        except OSError:
+            pass
+    return n
+
+class WatchLive:
+    """Liveness of the watched session in three states, held | absent |
+    unknown (a failed ps or lsof is never "ended"), plus ended once a held
+    session goes away. Claude: the same registry proof as the kill check,
+    then that pid's own file, which also says when the window switched
+    sessions (/clear, /resume) or parked it as a background job. Codex: the
+    thread-writer lock holder. check() -> (live, (new target, why) | None)."""
+
+    def __init__(self, t):
+        self.t, self.pid, self.held, self.gone, self.pids, self.last = t, None, False, 0, [], None
+
+    def check(self):
+        live, move = self._claude() if self.t['tool'] == 'claude' else (self._codex(), None)
+        if live.get('state') == 'held':
+            self.held, self.last = True, live
+        return live, move
+
+    def _gone(self):
+        return {'state': 'ended' if self.held else 'absent'}
+
+    def _move(self, sid, why):
+        path = _find_claude_transcript(sid)
+        nt = watch_target(path) if path else None
+        if not nt:
+            return dict(self.last or {'state': 'held'}, note='%s; waiting for its transcript' % why), None
+        nt.update(title=self.t.get('title', ''), cwd=self.t.get('cwd', ''))
+        return dict(self.last or {'state': 'held'}), (nt, why)
+
+    def _claude(self):
+        t = self.t
+        regs = claude_registry()
+        if regs is None:
+            return {'state': 'unknown', 'why': 'no session registry'}, None
+        mine = [r for r in regs if r['sessionId'] == t['sid']]
+        if self.pid is None and not mine:
+            return self._gone(), None
+        procs, _, ok = proc_table_ok()
+        if not ok:
+            return {'state': 'unknown', 'why': 'ps failed'}, None
+        if self.pid is not None:
+            # Re-prove the window every time (alive, started at its procStart,
+            # a claude binary): a reused pid with a stale file is never followed.
+            rec = next((r for r in regs if r['pid'] == self.pid), None)
+            if rec is None and os.path.exists(os.path.join(CLAUDE_SESSIONS, '%d.json' % self.pid)):
+                # There but unreadable (mid-rewrite, or damaged): not proof of an exit.
+                return {'state': 'unknown', 'why': 'registry entry unreadable'}, None
+            if rec is None or not claude_exact(procs, [rec]).get(rec['sessionId']):
+                self.gone += 1               # deleted on exit; give a rewrite a moment
+                if self.gone >= 2:
+                    self.pid = None
+                    return self._gone(), None
+                return dict(self.last or {'state': 'held'}), None
+            self.gone = 0
+            job = rec.get('parkedJobId')
+            if isinstance(job, str) and job:
+                bg = next((r for r in regs if r.get('kind') == 'bg' and r.get('jobId') == job), None)
+                if bg is None:
+                    return dict(self.last or {'state': 'held'}, note='parked; waiting for its background job'), None
+                return self._move(bg['sessionId'], 'moved to background job %s' % clean_line(job))
+            if rec['sessionId'] != t['sid']:
+                return self._move(rec['sessionId'], 'session changed')
+        hit = claude_exact(procs, mine).get(t['sid'])
+        if not hit:
+            return self._gone(), None
+        self.pid = hit[0][0]
+        reg = next(r for r in mine if r['pid'] in hit[0])
+        w = reg.get('waitingFor')
+        w = w if w in W_WAITING else (clean_line(w)[:40] if isinstance(w, str) else '')
+        return {'state': 'held', 'pids': hit[0], 'status': hit[1], 'waiting': w,
+                'subagents': _subagents_writing(t) if t['kind'] == 'root' else 0}, None
+
+    def _codex(self):
+        t = self.t
+        procs, test, ok = proc_table_ok()
+        if not ok:
+            return {'state': 'unknown', 'why': 'ps failed'}
+        held, ok = codex_holders_ok(procs, test, codex_writers(procs), {t['path']: t['sid']})
+        if not ok:
+            return {'state': 'unknown', 'why': 'lsof failed'}
+        if held.get(t['sid']):
+            self.pids = sorted(set(held[t['sid']]))
+            return {'state': 'held', 'pids': self.pids}
+        if self.held and any(p in self.pids for ps in held.values() for p in ps):
+            # Same window, another thread (/new): which one is foreground isn't
+            # recorded, so say so instead of guessing.
+            return {'state': 'absent', 'note': 'this Codex window moved on; pick it from the list'}
+        return self._gone()
+
+def _hhmm(ts):
+    return time.strftime('%H:%M', time.localtime(ts)) if ts else '?'
+
+def watch_status(t, feed, live, mtime):
+    st = live.get('state')
+    if st == 'held':
+        if t['tool'] == 'claude':
+            s = clean_line(live.get('status') or '') or 'live'
+            busy = s == 'busy'
+        else:
+            busy = feed.busy if feed.busy is not None else (True if feed.pending else None)
+            s = 'busy' if busy else ('idle' if busy is False else 'live')
+        parts = ['● ' + s]
+        newest = max(feed.pending.values(), key=lambda v: v[1]) if feed.pending else None
+        if s == 'waiting' and live.get('waiting'):
+            parts.append(live['waiting'] + ((' for ' + newest[0]) if newest else ''))
+        elif busy and newest:
+            more = len(feed.pending) - 1
+            parts.append('running %s since %s%s' % (newest[0], _hhmm(newest[1]), (' (+%d)' % more) if more else ''))
+        elif busy and feed.thinking:
+            parts.append('thinking')
+        n = live.get('subagents') or 0
+        if n:
+            parts.append('%d subagent%s writing' % (n, '' if n == 1 else 's'))
+    elif st == 'unknown':
+        parts = ['? live state unknown' + ((' (%s)' % live['why']) if live.get('why') else '')]
+    elif st == 'ended':
+        parts = ['session ended']
+    else:
+        parts = ['not running' + ((' · last write ' + _hhmm(mtime)) if mtime else '')]
+    if live.get('note'):
+        parts.append(live['note'])
+    parts.append('q stop')
+    return clean_line(' · '.join(parts))
+
+def watch_lines(ev, tool, width, color):
+    """One event -> display lines. Messages keep a label column and wrap in
+    the terminal; one-liners are fitted to the width BEFORE color is added.
+    Every string is sanitized here again: callers are not trusted."""
+    W = max(20, width - 1)
+    kind = ev[0]
+    if kind in ('you', 'task', 'ai'):
+        body = _format_message(ev[1])
+        if not color:
+            body = [_SGR_RE.sub('', ln) for ln in body]
+        if not body:
+            return []
+        lab = {'you': 'You:', 'task': 'Task:', 'ai': 'Codex:' if tool == 'codex' else 'Claude:'}[kind]
+        pad = ' ' * (W_LABEL - len(lab))
+        lab = ((P_AI if kind == 'ai' else P_YOU) + lab + P_OFF + pad) if color else lab + pad
+        return [lab + body[0]] + [' ' * W_LABEL + ln for ln in body[1:]]
+    if kind == 'tool':
+        head = '  › ' + clean_line(ev[1])
+        line = fit(head + (('  ' + clean_line(ev[2])) if ev[2] else ''), W)
+        if color:
+            line = (P_LBL + head + P_OFF + line[len(head):]) if line.startswith(head) else P_LBL + line + P_OFF
+        return [line]
+    if kind == 'fail':
+        line = fit('  ✗ ' + ((clean_line(ev[1]) + '  ') if ev[1] else '') + (clean_line(ev[2]) or 'failed'), W)
+        return [(P_FAIL + line + P_OFF) if color else line]
+    line = fit('  ── %s ──' % clean_line(ev[1]), W)
+    return [(P_DIM + line + P_OFF) if color else line]
+
+def watch_header(t, width, color):
+    what = t['tool'] + (' subagent' if t['kind'] == 'child' else '')
+    line = fit(clean_line('── watching: %s · %s · %s · read-only, q stops ──' % (
+        t['title'], what, tilde(t['cwd'] or '?'))), max(20, width - 1))
+    return (P_TITLE + line + P_OFF) if color else line
+
+def _card_dict(card):
+    try:
+        c = json.loads(unquote(card)) if card else {}
+    except ValueError:
+        c = {}
+    return c if isinstance(c, dict) else {}
+
+class WatchFile:
+    """Follows one transcript by bytes from an offset. Only complete lines
+    come out (a torn tail waits for its newline, so a UTF-8 character split
+    across writes decodes whole); a record over W_MAX_REC is dropped up to
+    its newline and reported once as None. poll() also reports a file that
+    was truncated, replaced, or missing for 2 s."""
+
+    def __init__(self, path, offset):
+        self.path, self.buf, self.skip, self.missing, self.gone = path, b'', False, None, False
+        self.fh = _open_ro(path)
+        self.fh.seek(offset)
+        self.pos = offset
+        st = os.fstat(self.fh.fileno())
+        self.ident, self.seen = (st.st_dev, st.st_ino), (st.st_size, st.st_mtime_ns)
+        n = min(64, offset)
+        self.sig = os.pread(self.fh.fileno(), n, offset - n) if n else b''
+
+    def close(self):
+        self.fh.close()
+
+    def mtime(self):
+        try:
+            return os.fstat(self.fh.fileno()).st_mtime
+        except OSError:
+            return 0
+
+    def poll(self, now):
+        """-> (records, event): event is None, 'truncated', 'replaced' or 'gone'."""
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            if self.missing is None:
+                self.missing = now
+            out = self._read()
+            if not self.gone and now - self.missing >= 2:
+                self.gone = True
+                return out, 'gone'
+            return out, None
+        except OSError:
+            return self._read(), None
+        if self.missing is not None or (st.st_dev, st.st_ino) != self.ident:
+            return self._read(), 'replaced'          # back after a gap counts as new
+        if st.st_size < self.pos:
+            return [], 'truncated'
+        if (st.st_size, st.st_mtime_ns) != self.seen:
+            self.seen = (st.st_size, st.st_mtime_ns)
+            # Rewritten in place to the same size or longer: the bytes just
+            # before where we are reading no longer match.
+            if self.sig and os.pread(self.fh.fileno(), len(self.sig), self.pos - len(self.sig)) != self.sig:
+                return [], 'truncated'
+        return self._read(), None
+
+    def _read(self):
+        out = []
+        for _ in range(32):                          # <= 32 MB a poll keeps keys responsive
+            data = self.fh.read(1 << 20)
+            if not data:
+                break
+            self.pos += len(data)
+            self.sig = (self.sig + data)[-64:]
+            out.extend(self._split(data))
+        return out
+
+    def _split(self, data):
+        buf, pos, out = self.buf + data, 0, []
+        while True:
+            i = buf.find(b'\n', pos)
+            if i < 0:
+                break
+            line, pos = buf[pos:i], i + 1
+            if self.skip:
+                self.skip = False                    # the tail of the record already reported
+            elif len(line) > W_MAX_REC:
+                out.append(None)
+            elif line:
+                out.append(line)
+        rest = buf[pos:]
+        if len(rest) > W_MAX_REC:
+            rest = b''
+            if not self.skip:
+                self.skip = True
+                out.append(None)
+        self.buf = rest
+        return out
+
+class WatchUI:
+    """Streams feed lines into the terminal's own scrollback, with the status
+    as the last line: cleared before new lines, repainted after them, and
+    rewritten only when its text changes."""
+
+    def __init__(self, fd):
+        self.fd, self.status = fd, ''
+        self.resize()
+
+    def resize(self):
+        try:
+            self.width = os.get_terminal_size(self.fd).columns
+        except OSError:
+            self.width = 80
+
+    def _write(self, s):
+        b = s.encode('utf-8', 'replace')
+        while b:
+            try:
+                b = b[os.write(self.fd, b):]
+            except InterruptedError:
+                continue
+
+    def _bar(self):
+        txt = fit(self.status, max(1, self.width - 1))
+        if txt.startswith('● '):
+            word = txt[2:].split(' ', 1)[0]
+            dot = C_BUSY if word in ('busy', 'waiting', 'shell') else C_DOT
+            return dot + '●' + C_OFF + P_DIM + txt[1:] + P_OFF
+        return P_DIM + txt + P_OFF
+
+    def show(self, lines, status):
+        self.status = status
+        self._write('\r\033[2K' + ''.join(ln + '\n' for ln in lines) + self._bar())
+
+    def set_status(self, status, force=False):
+        if force or status != self.status:
+            self.status = status
+            self._write('\r\033[2K' + self._bar())
+
+    def end(self, line):
+        self._write('\r\033[2K' + line + '\n')
+
+def _watch_quit(fd, data):
+    """q, Q, ctrl-c and ctrl-d stop at once. Esc stops too, unless it starts a
+    key sequence: CSI (Esc [ ... final byte) or SS3 (Esc O x), like an arrow.
+    A lone Esc waits 300 ms for the rest of a sequence."""
+    import select
+    data = bytearray(data)
+    def more():
+        r, _, _ = select.select([fd], [], [], 0.3)
+        try:
+            got = os.read(fd, 64) if r else b''
+        except OSError:
+            got = b''                           # the terminal went away
+        data.extend(got)
+        return bool(got)
+    i = 0
+    while i < len(data):
+        b = data[i]
+        if b in (0x71, 0x51, 0x03, 0x04):
+            return True
+        if b != 0x1b:
+            i += 1
+            continue
+        if i + 1 >= len(data) and not more():
+            return True                         # a bare Esc
+        if data[i + 1] == 0x5b:                 # CSI: skip to its final byte
+            j = i + 2
+            while True:
+                while j < len(data) and not 0x40 <= data[j] <= 0x7e:
+                    j += 1
+                if j < len(data) or not more():
+                    break
+            i = j + 1
+        elif data[i + 1] == 0x4f:               # SS3: one more byte
+            if i + 2 >= len(data):
+                more()
+            i += 3
+        else:
+            return True                         # Esc then another key: the Esc was bare
+    return False
+
+def _watch_loop(t, fd, ui, flags):
+    import select
+    def note(text):
+        return watch_lines(('note', text), t['tool'], ui.width, True)
+    def backfill(divider=None):
+        """(feed, follower, lines) for the current target, or None while its
+        transcript can't be opened."""
+        feed, evs, off = watch_backfill(t)
+        try:
+            wf = WatchFile(t['path'], off)
+        except OSError:
+            return None
+        lines = (note(divider) if divider else []) + [watch_header(t, ui.width, True)]
+        for ev in evs:
+            lines.extend(watch_lines(ev, t['tool'], ui.width, True))
+        return feed, wf, lines
+    def same_target():
+        nt = watch_target(t['path'])                # still inside the session roots?
+        return bool(nt) and nt['tool'] == t['tool'] and nt['sid'] == t['sid']
+    got = backfill()
+    if got:
+        feed, wf, lines = got
+    else:
+        feed, wf, lines = WatchFeed(t['tool'], t['kind']), None, \
+            [watch_header(t, ui.width, True)] + note('waiting for the transcript')
+    # The feed first: ps and lsof can be slow on a busy machine.
+    ui.show(lines, 'checking whether it is running · q stop')
+    live = WatchLive(t)
+    lv, _ = live.check()
+    next_check = time.monotonic() + 2
+    while True:
+        r, _, _ = select.select([fd], [], [], 0.5)
+        if r:
+            try:
+                data = os.read(fd, 64)
+            except OSError:
+                return 0                            # hung up: nothing left to draw on
+            if not data or _watch_quit(fd, data):
+                ui.end(P_DIM + fit('── stopped watching; the session was not touched ──',
+                                   max(1, ui.width - 1)) + P_OFF)
+                return 0
+        if flags.pop('winch', None):
+            ui.resize()
+            ui.set_status(ui.status, force=True)
+        now = time.monotonic()
+        out = []
+        if wf is None:
+            # Emptied, replaced by something unreadable, or briefly missing:
+            # retry until it is a transcript of this session again.
+            got = backfill('transcript restarted') if same_target() else None
+            if got:
+                feed, wf, more = got
+                out.extend(more)
+        else:
+            recs, ev = wf.poll(now)
+            for rec in recs:
+                evs = [('note', 'large entry skipped')] if rec is None else feed.take_line(rec)
+                for e in evs:
+                    out.extend(watch_lines(e, t['tool'], ui.width, True))
+            if ev in ('replaced', 'truncated'):
+                wf.close()
+                wf = None
+                got = backfill('transcript replaced' if ev == 'replaced' else 'transcript restarted') \
+                    if same_target() else None
+                if got:
+                    feed, wf, more = got
+                    out.extend(more)
+                else:
+                    out.extend(note('waiting for the transcript'))
+            elif ev == 'gone':
+                out.extend(note('transcript gone'))
+        if now >= next_check:
+            next_check = now + 2
+            lv, move = live.check()
+            if move:
+                t, why = move
+                got = backfill(why)
+                if got:
+                    if wf:
+                        wf.close()
+                    feed, wf, more = got
+                    out.extend(more)
+                live = WatchLive(t)
+                lv, _ = live.check()
+        status = watch_status(t, feed, lv, wf.mtime() if wf else 0)
+        if out:
+            ui.show(out, status)
+        else:
+            ui.set_status(status)
+
+def watch_run(t):
+    """The interactive view on /dev/tty (also when stdout is fzf's or the
+    shell function's capture pipe). Keyboard echo, line editing, signal keys,
+    flow control and (on macOS) ctrl-o's output discard are off while it
+    runs; output processing stays on. Settings are restored on any exit."""
+    import signal, termios
+    try:
+        fd = os.open('/dev/tty', os.O_RDWR | getattr(os, 'O_NOCTTY', 0))
+    except OSError:
+        print('baton: watch needs a terminal', file=sys.stderr)
+        return 1
+    try:
+        old = termios.tcgetattr(fd)
+    except termios.error:
+        os.close(fd)
+        print('baton: watch needs a terminal', file=sys.stderr)
+        return 1
+    new = termios.tcgetattr(fd)
+    new[0] &= ~(termios.IXON | termios.ICRNL)
+    new[3] &= ~(termios.ECHO | termios.ICANON | termios.ISIG | termios.IEXTEN)
+    new[6][termios.VMIN], new[6][termios.VTIME] = 1, 0
+    flags = {}
+    def stop(signum, frame):
+        raise SystemExit(128 + signum)
+    def winch(signum, frame):
+        flags['winch'] = True
+    prev = {}
+    for sig, handler in ((signal.SIGTERM, stop), (signal.SIGHUP, stop), (signal.SIGWINCH, winch)):
+        prev[sig] = signal.signal(sig, handler)
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        return _watch_loop(t, fd, WatchUI(fd), flags)
+    finally:
+        try:
+            os.write(fd, b'\r\033[2K')               # no status left beside the next prompt
+        except OSError:
+            pass
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, old)
+        except termios.error:
+            pass
+        for sig, handler in prev.items():
+            signal.signal(sig, handler)
+        os.close(fd)
+
+def watch_main(path, card, once):
+    t = watch_target(path)
+    if not t:
+        print('baton: not a claude or codex session file: %s' % clean_line(path), file=sys.stderr)
+        return 2
+    c = _card_dict(card)
+    t['title'] = clean_line(c.get('t') or '') or 'session %s' % clean_line(t['sid'])[:8]
+    t['cwd'] = clean_line(c.get('cwd') or t.get('cwd') or '') or \
+        clean_line(first_str((read_windows(t['path']) or (None, b''))[1], 'cwd') or '')
+    if not once:
+        return watch_run(t)
+    feed, events, _ = watch_backfill(t)
+    try:
+        width = int(os.environ.get('COLUMNS') or 100)
+    except ValueError:
+        width = 100
+    try:
+        mtime = os.stat(t['path']).st_mtime
+    except OSError:
+        mtime = 0
+    out = [watch_header(t, width, False)]
+    for ev in events:
+        out.extend(watch_lines(ev, t['tool'], width, False))
+    out.append(fit(watch_status(t, feed, WatchLive(t).check()[0], mtime), max(20, width - 1)))
+    print('\n'.join(out))
+    return 0
+
 # ---------- main ----------
 def main(argv):
     mode = argv[1] if len(argv) > 1 else 'dump'
@@ -1948,6 +2876,9 @@ def main(argv):
             {'result': 'refused', 'pids': []}
         print('%s\x1f%s' % (r['result'], ','.join(str(p) for p in r['pids'])))
         return 0
+    if mode == 'watch':
+        rest = [a for a in argv[2:] if a != '--once']
+        return watch_main(rest[0] if rest else '', rest[1] if len(rest) > 1 else '', '--once' in argv[2:])
     print('baton: unknown scanner mode %r' % mode, file=sys.stderr)
     return 2
 
@@ -2008,6 +2939,7 @@ case "${1:-}" in
   --stats)      _scan stats; exit $? ;;
   --kill-check) shift; _scan kill-check "$@"; exit $? ;;
   --kill)       shift; _scan kill "$@"; exit $? ;;
+  --watch-session) shift; _scan watch "$@"; exit $? ;;
 esac
 
 # --- UI state -----------------------------------------------------------------
@@ -2130,6 +3062,13 @@ if [ "${1:-}" = "--key" ]; then
       else printf 'ignore'; fi ;;
     resize)                                   # re-fill to the new height (list only)
       if [ -z "$q" ]; then printf '%s' "$trl"; else printf 'ignore'; fi ;;
+    watch)                                    # ctrl-o: follow the row's transcript read-only,
+      # then reload so the live dots are fresh when the list comes back. No
+      # track-current: watching doesn't reshape the list, and tracking would
+      # block the keys typed right after quitting until the reload lands.
+      if [ -n "$a1" ] && { [ "$a2" = session ] || [ "$a2" = child ]; }; then
+        printf 'execute(%s --watch-session {1} {9})+%s' "$selfq" "$rl"
+      else printf 'ignore'; fi ;;
     esc)                                      # typing: clear (change reloads); else quit
       if [ -n "$q" ]; then printf 'clear-query'; else printf 'abort'; fi ;;
     *) printf 'ignore' ;;
@@ -2202,7 +3141,7 @@ fi
 
 # Two short header lines (they must fit the narrow list pane). The first input
 # row is a status line (hidden counts / match count), pinned via --header-lines.
-hdr=$'type to search · enter resume · esc clear/quit\n+ folder · →/← subagents · ctrl-a automated · ctrl-t tool'
+hdr=$'type to search · enter resume · ctrl-o watch · esc clear/quit\n+ folder · →/← subagents · ctrl-a automated · ctrl-t tool'
 
 # Baton owns filtering (fzf --disabled): `change` drives an async reload of
 # unified name+content results (fzf's documented `change:reload {q}` pattern).
@@ -2212,8 +3151,16 @@ hdr=$'type to search · enter resume · esc clear/quit\n+ folder · →/← suba
 # sticky with ~7; `follow` shows the END of the transcript (the newest turn) a
 # full pane high. --sync + start:<down…> put the cursor on the first SESSION
 # (past the status row and however many folder headers precede it, e.g. an
-# empty "here" folder followed by the first real one).
+# empty "here" folder followed by the first real one). A list action's
+# track-current stays on until focus moves, and a reload while tracking blocks
+# input, so `change` untracks first: fast typing after +, →, ctrl-t or a
+# watch keeps every key. --no-height/--no-popup override a height or popup in
+# FZF_DEFAULT_OPTS: the list is sized to the whole terminal, and only
+# full-screen fzf leaves its alternate screen for execute(), which keeps
+# ctrl-o's feed in the terminal's scrollback.
 sel=$(printf '%s\n' "$rows" | fzf \
+  --no-height \
+  --no-popup \
   --ansi \
   --disabled \
   --delimiter='\t' \
@@ -2236,9 +3183,10 @@ sel=$(printf '%s\n' "$rows" | fzf \
   --bind="=:transform($SELFq --key equal {q} {5})" \
   --bind="right:transform($SELFq --key right {q} {6} {7})" \
   --bind="left:transform($SELFq --key left {q} {6} {7})" \
-  --bind="change:reload($SELFq --render {q})" \
+  --bind="change:untrack-current+reload($SELFq --render {q})" \
   --bind="esc:transform($SELFq --key esc {q})" \
   --bind="resize:transform($SELFq --key resize {q})" \
+  --bind="ctrl-o:transform($SELFq --key watch {q} {1} {7})" \
   --bind='enter:transform([ -n {3} ] && echo accept || echo ignore)')
 [ -z "$sel" ] && exit 0
 
@@ -2261,6 +3209,7 @@ IFS=$'\x1f' read -r ok pids title status reason started <<<"$info"
 if [ "$ok" = 1 ]; then
   {
     printf 'This session is LIVE: "%s" (%s, pid %s%s)\n' "$title" "$tool" "$pids" "${status:+, $status}"
+    printf '(To only watch it, answer n, then run %s again and press ctrl-o on it.)\n' "$PROG"
     printf 'End that process and resume here? [y/N] '
   } >/dev/tty
   read -r ans </dev/tty
