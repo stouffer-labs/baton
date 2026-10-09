@@ -61,6 +61,7 @@ Each session is titled the way the native pickers title it. For Claude it uses y
 
 - **Type to search.** One search box matches session titles and prompts, plus branches and folders. It also searches the text of the conversations. Results stay grouped under their folders. Searching inside conversations needs ripgrep.
 - **Enter** resumes the highlighted session. Baton changes to the session's original folder first.
+- **Ctrl-O** watches the highlighted session without taking it over. See [Watching a session](#watching-a-session-without-taking-it-over).
 - **`+`** (or **`=`**) expands the highlighted folder to show all of its sessions. Press it again to collapse. While you're typing they're just characters, so you can search for `a=b` or `C++`.
 - **→ / ←** unfold and fold the highlighted session's subagents. While you're typing they move the cursor.
 - **Ctrl-A** shows or hides automated and continued sessions. The prompt reads `both+all>` while they're shown.
@@ -81,6 +82,36 @@ Resuming a session that is still running somewhere would let the conversation sp
 - For Codex it looks for the process that holds the session's lock file in `~/.codex/thread-writer-locks/`.
 - When a Codex process is running in a session's folder but baton can't tell which session it holds, the row gets a dim `◌`. Baton only warns you in that case and never ends the process.
 
+### Watching a session without taking it over
+
+Sometimes you only want to see what a session is doing. Say a session on your Mac is driving a browser and you're on another machine over SSH. Resuming it there would end the local process, and the copy in your SSH terminal can't reach the Mac's screen anyway. Press **Ctrl-O** on the session instead and baton follows it read-only.
+
+The view starts with the activity since your second-to-last prompt and then shows new activity as it arrives:
+
+```
+── watching: fix login redirect · claude · ~/proj · read-only, q stops ──
+You:    fix the login redirect and run e2e
+Claude: Fixing it, then running the suite.
+  › Edit  ~/proj/src/auth/callback.ts
+  › Bash  Run e2e suite
+  ✗ Bash  exit 1: 2 tests failed
+● busy · running Bash since 14:02 · q stop
+```
+
+- Each tool call gets one line when it starts. A failed tool gets a `✗` line. Successful results and the model's thinking are left out.
+- The last line is a status line. For Claude it shows whether the session is busy, idle or waiting. While it waits it also says what for, like a permission prompt. It also shows which tool is running and since when. For Codex it shows busy or idle and the running tool.
+- The feed goes into your terminal's normal scrollback, so the mouse wheel and copy and paste work as usual.
+- Press **q** (or Esc or Ctrl-C) to go back to the list where you left it.
+- After `/clear` the watch follows the session's new conversation. It does the same when a Claude session moves to the background.
+
+Watching never touches the session. The viewer reads the transcript and the session registry, and it runs `ps` and `lsof`. It never sends a signal and never runs `claude` or `codex`. It never connects to their sockets and it writes no files. When you go back to the list, baton refreshes its own cache as it always does.
+
+It's the transcript and not the screen, so a few things don't show:
+
+- Dialogs and spinners in the session's own window don't appear. A Claude permission prompt shows as a status, and a Codex approval prompt doesn't show at all.
+- Claude writes its transcript a few seconds behind, so the view lags by about 3 to 5 seconds. Codex writes at once but records a tool's output only when the tool finishes.
+- A brand-new Codex session gets a row only after its first prompt.
+
 ### You land in the project folder afterward
 
 Shell integration is installed by default, and with it `baton` runs as a shell function. It changes your shell into the session's folder and resumes. When the session ends your shell is still in that folder, so you can run `baton` again or `claude --resume` right there.
@@ -97,12 +128,13 @@ This needs a shell function because a normal command runs as a child process. A 
 - **Reading them quickly.** Like `claude --resume`, baton reads only the first and last 64 KB of each Claude transcript. What it learns about each file is cached in `~/.cache/baton/index.json` (readable only by you), so later launches only re-read files that changed.
 - **Original folder.** Resume only finds a session id when it runs from the folder the session started in, so baton changes to that folder before resuming.
 - **Safety.** Titles and transcript text come from files that other programs wrote. Baton strips terminal escape sequences out of them before showing anything.
+- **Full screen.** Baton always runs fzf full screen. It overrides a height or popup set in `FZF_DEFAULT_OPTS`, so the list fills the terminal and a watched session's feed stays in your scrollback.
 
 Run `python3 -m unittest discover -s tests` to run the test suite. It builds fake Claude and Codex homes under `tmp/` and never touches your real sessions.
 
 ## Caveats
 
-- This is a handoff model. Resume a session in one place at a time. Driving the same session on two machines at once would split the conversation.
+- This is a handoff model. Resume a session in one place at a time. Driving the same session on two machines at once would split the conversation. To keep an eye on a session without moving it, watch it with Ctrl-O.
 - The session files live on local disk, so resuming from another machine works when you SSH into the machine that holds them.
 
 ## Contributing
