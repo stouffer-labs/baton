@@ -1,7 +1,7 @@
 # Watch mode: how it was built
 
 **Date:** 2026-10-09
-**Status:** Shipped. The local commits are `32a1646` (spec), `d69e86e` (code and tests) and `4d9b6f0` (README). They were published to `stouffer-labs/baton` as `66f0d29`, and CI passed on Ubuntu and macOS.
+**Status:** Shipped. The local commits are `32a1646` (spec), `d69e86e` (code and tests) and `4d9b6f0` (README). They were published to `stouffer-labs/baton` as `66f0d29`, and CI passed on that commit on Ubuntu and macOS. This history doc and its line in the publish list came after, as local `7057b6d` and GitHub `4ddb21c`. Those two changes touch only docs and the publish script, which CI doesn't run.
 
 This is the record of how Ctrl-O watch mode was added. It covers the research and the decisions first. Then it covers the code, the reviews and the testing. The user-facing instructions are in the README under "Watching a session without taking it over".
 
@@ -125,6 +125,9 @@ One testing lesson is worth keeping. Don't switch git branches while a test run 
 
 ## Follow-ups
 
-- Eric still needs to check from the Windows PC that `›` and `✗` render and that the mouse wheel scrolls back.
+- Eric still needs to check a few things from the Windows PC:
+  - Ctrl-O reaches the Mac over OpenSSH
+  - `›` and `✗` render
+  - the mouse wheel scrolls back through the feed
 - Read compressed `.jsonl.zst` Codex rollouts once Codex starts writing them.
 - Possibly show subagent activity inline. Today the status only counts subagent files written in the last 30 seconds.
