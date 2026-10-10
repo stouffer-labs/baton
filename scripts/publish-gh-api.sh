@@ -268,6 +268,7 @@ ALLOWLIST=(
   "bin/baton"
   ".github/workflows"
   "docs/design-history.md"
+  "docs/watch-mode-history.md"
   "scripts/install.sh"
   "scripts/publish-gh-api.sh"
   "tests/test_baton.py"
